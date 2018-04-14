@@ -6,13 +6,44 @@ program im;
 uses
 	CTypes, Windows;
 
-{$define pp_repeat :=
+// Повторяет times раз фрагмент rep, с repid от 0 до times - 1.
+// Например, {$define rep := {$if repid > 0} + {$endif} A[repid]} {$define times := 3} pp_repeat преобразуется в A[0] + A[1] + A[2].
+{$define pp_repeat := {$if defined(repid)} {$error pp_repeat would hide defines} {$endif}
 	{$if times >= 1} {$define repid := 0} rep {$endif} {$if times >= 2} {$define repid := 1} rep {$endif}
 	{$if times >= 3} {$define repid := 2} rep {$endif} {$if times >= 4} {$define repid := 3} rep {$endif}
 	{$if times >= 5} {$error too many repeats} {$endif} {$undef repid} {$undef times} {$undef rep}}
 
+// Объявляет внутри объекта энум enum и константы, дублирующие его значения, чтобы вместо Object.EnumType.EnumValue можно было писать Object.EnumValue.
+// Например, {$define enum := Channel} {$define items := Red _ 0 _ Green _ 1 _ Blue _ 2} преобразуется в
+// type
+//     Channel = (Red, Green, Blue);    // дословно: Channel = (Red := 0, Green := 1, Blue := 2);
+// const
+//     Red = Channel.Red;               //           Red = Channel(0);
+//     Green = Channel.Green;           //           Green = Channel(1);
+//     Blue = Channel.Blue;             //           Blue = Channel(2);
+{$define declare_scoped_enum_with_shortcuts :=
+	{$if defined(now_number) or defined(_)} {$error declare_scoped_enum_with_shortcuts would hide defines} {$endif}
+	type
+		enum = {$define _ := {$ifdef now_number} , {$undef now_number} {$else} := {$define now_number} {$endif}} (items); {$undef now_number}
+	const
+		{$define _ := {$ifdef now_number} ); {$undef now_number} {$else} = enum( {$define now_number} {$endif}} items _ {$undef now_number}
+		{$undef enum} {$undef items} {$undef _}}
+
+const
+	EOL = LineEnding;
+	CPU = {$if defined(CPU32)} 'x86' {$elseif defined(CPU64)} 'x64' {$else} {$error unknown CPU} {$endif};
+
+type
+	widestring = unicodestring;
+	UTFchar = type uint32;
+	FilePos = type uint64;
+	FileSize = type uint64;
+	casint = int32;
+	sint = int32; uint = uint32;
+	float = single;
+
 {$define impl :=
-	function ToString(x: typename): string; begin str(x, result); end;
+	function ToString(const x: typename): string; begin str(x, result); end;
 	function TryParse(const s: string; out v: typename; wrong: pSizeInt = nil): boolean;
 	var
 		code: word;
@@ -22,59 +53,112 @@ uses
 		if not result and Assigned(wrong) then wrong^ := code;
 	end;
 
-	function min(a, b: typename): typename; begin if a <= b then result := a else result := b; end;
-	function max(a, b: typename): typename; begin if a >= b then result := a else result := b; end; {$undef typename}}
+	function min(const a, b: typename): typename; begin if a <= b then result := a else result := b; end;
+	function max(const a, b: typename): typename; begin if a >= b then result := a else result := b; end; {$undef typename}}
 	{$define typename := int32} impl {$define typename := uint32} impl  {$define typename := int64} impl {$define typename := uint64} impl
 {$undef impl}
 
-type
-	widestring = unicodestring;
-	UTFchar = type uint32;
-	FilePos = type uint64;
-	FileSize = type uint64;
-	casint = int32;
-	sint = int32; uint = uint32;
+	function clamp(x, a, b: float): float;
+	begin
+		if (x >= a) and (x <= b) then result := x else
+			if x > a then result := b else result := a;
+	end;
 
 type
 	Exception = class;
 
-	Win32 = object
-	const
-		USE_GETLASTERROR = High(DWORD) - 1;
-
-		class function DescribeError(code: DWORD = USE_GETLASTERROR): string; static;
-		class function OperationFailed(const what: string; code: DWORD = USE_GETLASTERROR): Exception; static;
-		class function FileError(const fn: string; code: DWORD = USE_GETLASTERROR): Exception; static;
-		class function Lowercase(const text: string): string; static;
-		class procedure Warning(const what: string; code: DWORD = USE_GETLASTERROR); static;
-		class function CommandLineTail: string; static;
-	strict private
-		class procedure CheckForUSE_GETLASTERROR(var code: DWORD); static;
+	DLL = object
+		class procedure Load(out lib: DLL; const fn: string; const fns: array of const); static;
+		procedure Unload;
+	private
+		h: Windows.HANDLE;
+		fptrs: array of pPointer;
 	end;
 
+	Win32 = object
+	type
+		NTSTATUS = record value: uint32; end;
+		PTP_CALLBACK_INSTANCE = ^TP_CALLBACK_INSTANCE; TP_CALLBACK_INSTANCE = record end;
+		PTP_CALLBACK_ENVIRON = ^TP_CALLBACK_ENVIRON; TP_CALLBACK_ENVIRON = record end;
+		PTP_IO = ^TP_IO; TP_IO = record end;
+
+		TP_IO_CALLBACK = procedure(Instance: PTP_CALLBACK_INSTANCE; Context: pointer;
+			Overlapped: LPOVERLAPPED; IoResult: Windows.ULONG; NumberOfBytesTransferred: Windows.ULONG_PTR; Io: PTP_IO); stdcall;
+
+		ErrorCode = object
+		type
+			Origin = (GetLastError, NTSTATUS);
+		var
+			value: dword;
+			from: Origin;
+			class function Create(value: dword; from: Origin): ErrorCode; static;
+		end;
+
+	class var
+		CreateThreadpoolIo: function(fl: Windows.HANDLE; pfnio: TP_IO_CALLBACK; pv: pointer; pcbe: PTP_CALLBACK_ENVIRON): PTP_IO; stdcall;
+		StartThreadpoolIo: procedure(pio: PTP_IO); stdcall;
+
+		class procedure Init; static;
+		class procedure Done; static;
+		class function DescribeError(const code: ErrorCode): string; static;
+		class function Error(const fmt: string; const args: array of const; const code: ErrorCode): Exception; static;
+		class function FileError(const fn: string; const code: ErrorCode): Exception; static;
+		class function OperationFailed(const what: string; const code: ErrorCode): Exception; static;
+		class function Lowercase(const text: string): string; static;
+		class procedure Warning(const what: string; const code: ErrorCode); static;
+		class function CommandLineTail: string; static;
+
+	const
+		STATUS_CANCELLED = $C0000120;
+
+	type
+		QueryStringCallback = procedure(buf: pWideChar; nBuf: size_t; out len: size_t; param: pointer);
+		UnparaQueryStringCallback = procedure(buf: pWideChar; nBuf: size_t; out len: size_t);
+	const
+		QUERY_STRING_LENGTH_UNKNOWN = High(size_t);
+		class function QueryString(cb: QueryStringCallback; param: pointer; const ofWhat: string): widestring; static;
+	private
+		class procedure QueryModuleFileName(buf: pWideChar; nBuf: size_t; out len: size_t; param: pointer); static;
+
+	strict private class var
+		k32: DLL;
+	end;
+
+	operator :=(code: dword): Win32.ErrorCode; begin result := result.Create(code, result.Origin.GetLastError); end;
+	operator :=(code: Win32.NTSTATUS): Win32.ErrorCode; begin result := result.Create(code.value, result.Origin.NTSTATUS); end;
+
+type
 	ThreadLock = object
 		cs: CRITICAL_SECTION;
 		ok: boolean;
-		procedure Init; procedure Done; procedure Enter; procedure Leave;
+		procedure Init;
+		procedure Done;
+		procedure Enter;
+		procedure Leave;
 	end;
 
 	ThreadEvent = object
 		h: HANDLE;
-		procedure Init(manual, initialState: boolean); procedure Done; function OK: boolean; procedure &Set; procedure Reset; procedure Wait;
+		procedure Init(manual: boolean; initialState: boolean = false);
+		procedure Done;
+		function OK: boolean;
+		procedure &Set;
+		procedure Reset;
+		procedure Wait;
 	end;
 
 	Console = object
-	type
-		Color = (Black, Maroon, Green, Olive, Navy, Purple, Teal, Silver, Gray, Red, Lime, Yellow, Blue, Fuchsia, Aqua, White);
+	{$define enum := Color} {$define items := Black _ 0 _ Maroon _ 1 _ Green _ 2 _ Olive _ 3 _ Navy _ 4 _ Purple _ 5 _ Teal _ 6 _ Silver _ 7 _
+		Gray _ 8 _ Red _ 9 _ Lime _ 10 _ Yellow _ 11 _ Blue _ 12 _ Fuchsia _ 13 _ Aqua _ 14 _ White _ 15} declare_scoped_enum_with_shortcuts
 	var
 		procedure Init;
 		procedure Done;
 		function OK: boolean;
 		procedure Write(const s: string);
 		procedure Line(const s: string);
-		procedure Colored(const s: string; cl: SizeInt = -1); procedure Colored(const s: string; cl: Color);
-		procedure ColoredLine(const s: string);               procedure ColoredLine(const s: string; cl: Color);
-		function Escape(const s: string): string;
+		procedure Colored(const s: string; baseCol: SizeInt = -1); procedure Colored(const s: string; baseCol: Color);
+		procedure ColoredLine(const s: string);                    procedure ColoredLine(const s: string; baseCol: Color);
+		class function Escape(const s: string): string; static;
 	strict private
 		lock: ThreadLock;
 		hOut: HANDLE;
@@ -92,9 +176,6 @@ type
 		procedure UseWriteConsoleW(const text: string);
 
 	public const
-		Black = Color.Black; Maroon  = Color.Maroon;  Green = Color.Green; Olive = Color.Olive; Navy = Color.Navy; Purple = Color.Purple;
-		Teal  = Color.Teal;  Silver  = Color.Silver;  Gray  = Color.Gray;  Red   = Color.Red;   Lime = Color.Lime; Yellow = Color.Yellow;
-		Blue  = Color.Blue;  Fuchsia = Color.Fuchsia; Aqua  = Color.Aqua;  White = Color.White;
 		ColorNames: array[Color] of string = ('0', 'r', 'g', 'rg', 'b', 'rb', 'gb', '.3', '.6', 'R', 'G', 'RG', 'B', 'RB', 'GB', '1');
 	strict private const
 		BitsToColor: array[0 .. 15] of Color = (Black, Navy, Green, Teal, Maroon, Purple, Olive, Gray, Silver, Blue, Lime, Aqua, Red, Fuchsia, Yellow, White);
@@ -105,8 +186,8 @@ type
 	end;
 
 	&File = object
+	{$define enum := Flag} {$define items := Readable _ 0 _ Writeable _ 1 _ Existing _ 2 _ New _ 3 _ Temp _ 4} declare_scoped_enum_with_shortcuts
 	type
-		Flag = (Readable, Writeable, Existing, New, Temp);
 		Flags = set of Flag;
 
 		pOpenResult = ^OpenResult;
@@ -116,15 +197,36 @@ type
 		const
 			Empty: OpenResult = (ok: false; exist: false; errmsg: '');
 		end;
+		transferred_t = type SizeUint;
 
-	const
-		Readable = Flag.Readable; Writeable = Flag.Writeable; RW = [Readable, Writeable]; Existing = Flag.Existing; New = Flag.New; Temp = Flag.Temp;
+		IOStatus = object
+			function OK: boolean;
+			function Partial: boolean;
+			function Cancelled: boolean;
+			function Failed: boolean;
+			function ToException: Exception;
+		private
+			req: pointer; // pIORequest
+			code: Win32.ErrorCode;
+			transferred: transferred_t;
+			class function Create(req: pointer; const code: Win32.ErrorCode; const transferred: transferred_t; forceFail: boolean = false): IOStatus; static;
+		const
+			STRANGE_ERROR = High(DWORD) - 1; // code = STRANGE_ERROR обозначает случай, когда операция провалилась с code = 0 (ну мало ли).
+		end;
+
+		CompletionHandler = procedure(const status: IOStatus; param: pointer);
 
 		class procedure Open(out f: &File; const fn: string; flags: Flags = [Flag.Readable]; r: pOpenResult = nil); static;
 		procedure Close;
-		procedure Read(at: FilePos; buf: pointer; size: SizeUint);
-		procedure Write(at: FilePos; buf: pointer; size: SizeUint);
+		procedure Invalidate;
+		function Valid: boolean;
+		procedure Read(const at: FilePos; buf: pointer; size: SizeUint; onDone: CompletionHandler = nil; param: pointer = nil);
+		procedure Write(const at: FilePos; buf: pointer; size: SizeUint; onDone: CompletionHandler = nil; param: pointer = nil);
 		function Size: FileSize;
+		procedure CancelMyIORequests;
+
+	const
+		RW = [Readable, Writeable];
 
 	strict private type
 		pSharedHandle = ^SharedHandle;
@@ -137,10 +239,14 @@ type
 			procedure Close(var ref: pSharedHandle);
 		end;
 
-		pAsyncIORequest = ^AsyncIORequest;
-		AsyncIORequest = object
+		pIORequest = ^IORequest;
+		IORequest = object
 			ov: Windows.OVERLAPPED;
 			h: pSharedHandle;
+			size: SizeUint;
+			write: boolean;
+			onDone: CompletionHandler;
+			param: pointer;
 			data: array[0 .. 0] of ptruint;
 		end;
 
@@ -157,11 +263,13 @@ type
 		ref: pSharedHandle;
 		class function TryCreatePath(const fn: string; out err: dword; out rollback: PathRollback): boolean; static;
 		class procedure IOCompletionHandler(dwErrorCode: dword; dwNumberOfBytesTransfered: dword; lpOverlapped: Windows.LPOVERLAPPED); stdcall; static;
-		class function CreateAsyncIORequest(h: pSharedHandle; const offset: FilePos; extraSize: SizeUint): pAsyncIORequest; static;
-		class procedure CloseAsyncIORequest(a: pAsyncIORequest); static;
+		class function CreateIORequest(h: pSharedHandle; const offset: FilePos; size, extraSize: SizeUint; write: boolean; onDone: CompletionHandler; param: pointer): pIORequest; static;
+		class procedure CloseIORequest(a: pIORequest; const status: IOStatus); static;
+		procedure IO(write: boolean; const at: FilePos; buf: pointer; size: SizeUint; onDone: CompletionHandler; param: pointer);
+		class procedure OnDoneSync(const status: IOStatus; param: pointer); static;
 	strict private class var
-		AsioPending: casint;
-		HeyNoAsioPending: ThreadEvent;
+		IOPending: casint;
+		HeyNoIOPending: ThreadEvent;
 		class procedure GlobalInitialize; static;
 		class procedure GlobalFinalize; static;
 	public
@@ -169,6 +277,24 @@ type
 	end;
 
 type
+	// Это чтобы можно было добавлять элементы в массивы одной строкой (к сожалению, на типобезопасность при этом кладётся болт):
+	// Ary(a).Push(newItem, TypeInfo(a));
+	//
+	// вместо
+	// SetLength(a, length(a) + 1);
+	// a[High(a)] := newItem;
+	//
+	// Или, то же самое: ItemType(Ary(a).Grow(TypeInfo(a))^) := newItem;
+	//
+	// Q: Почему не дженерики?
+	// A: Fatal: Internal error 200509181 и подобное.
+	//
+	// Q: Почему не дженерик-списки из FGL?
+	// A: Все без исключения «стандартные» «правильные» решения, т. е. без публичных полей типа array of, будут иметь следующее ограничение:
+	//    type Struct = record x, y: integer; end;
+	//    var a: specialize TFPGList<Struct>;
+	//    a[1].y := 5;
+	//    Последняя строчка не скомпилируется. Array property перенаправляется в функцию, а функция в паскале не может вернуть l-value.
 	Ary = type pointer;
 	AryHelper = type helper for Ary
 		function Grow(elemSize: size_t): pointer;         function Grow(arrayTypeInfo: pointer): pointer;
@@ -202,10 +328,10 @@ type
 		function CodepointLen(pos: SizeInt): SizeInt;
 		function ToUTF16: widestring;
 		function Format(const args: array of const): string;
-		class function ToString(const v: TVarRec): string; static;
 		function Prefixed(const p: string; pos: SizeInt = 1): boolean;
+		function Tail(start: SizeInt): string;
 		function Lowercase: string; function LowercaseFirst: string;
-		function Stuffed(at: SizeInt; const &with: string): string;
+		function Stuffed(at, remove: SizeInt; const &with: string): string;
 
 	const
 		UTFInvalid = High(UTFchar);
@@ -229,6 +355,12 @@ type
 		function ToUTF8: string;
 	end;
 
+	VarRec = object
+		class procedure AssertType(const v: TVarRec; expected: SizeInt; pos: SizeInt); static;
+		class function VTypeToString(vt: SizeInt): string; static;
+		class function ToString(const v: TVarRec): string; static;
+	end;
+
 	Exception = class
 		msg: string;
 		constructor Create(const msg: string);
@@ -244,14 +376,14 @@ type
 		CanDieNow: boolean;
 		RainyDayReserve: pointer;
 		procedure ReleaseReserve;
-		class constructor InitGlobal;
-		class destructor DoneGlobal;
+		class procedure InitGlobal; static;
+		class procedure DoneGlobal; static;
 	end;
 
 	Session = object
 	private
 		class constructor Init;
-		class procedure Done; // все правильно, разруливается через AddExitProc
+		class procedure Done; static; // все правильно, разруливается через AddExitProc
 		class function HumanTrace(frames: pCodePointer = nil; frameCount: SizeInt = -1): string; static;
 		class procedure OnUnhandledException(Obj: TObject; Addr: CodePointer; FrameCount: LongInt; Frame: PCodePointer); static;
 		class procedure OnRuntimeError(ErrNo: Longint; Address: CodePointer; Frame: Pointer); static;
@@ -261,43 +393,168 @@ type
 var
 	SingletonLock: ThreadLock;
 	Con: Console;
+	ExecRoot: string;
+
+	class procedure DLL.Load(out lib: DLL; const fn: string; const fns: array of const);
+	var
+		i: SizeInt;
+		prefix: string;
+		parsed: array of record
+			funcName: string;
+			funcPtr: pPointer;
+		end;
+	begin
+		lib.h := 0;
+		lib.h := LoadLibraryW(pWideChar(fn.ToUTF16));
+		if lib.h = 0 then raise Win32.Error('Не удалось загрузить {}. {Err.}', [fn], GetLastError);
+		prefix := '';
+
+		try
+			parsed := nil;
+			i := 0;
+			while i < length(fns) do
+			begin
+				if (fns[i].VType = vtAnsiString) and ansistring(fns[i].VAnsiString).Prefixed('prefix=') then
+				begin
+					prefix := ansistring(fns[i].VAnsiString).Tail(length('prefix=') + 1);
+					inc(i);
+				end;
+
+				SetLength(parsed, length(parsed) + 1);
+				if fns[i].VType <> vtAnsiString then raise LogicError.Create('В позиции {} vt = {}, ожидается {} (vtAnsiString).'.Format([i, fns[i].VType, vtAnsiString]));
+				parsed[High(parsed)].funcName := prefix + ansistring(fns[i].VAnsiString);
+				inc(i); if i >= length(fns) then raise LogicError.Create('В позиции {} ожидается указатель на указатель на функцию.');
+
+				if fns[i].VType <> vtPointer then raise LogicError.Create('В позиции {} vt = {}, ожидается {} (vtPpointer).'.Format([i, fns[i].VType, vtPointer]));
+				parsed[High(parsed)].funcPtr := fns[i].VPointer;
+				inc(i);
+			end;
+
+			SetLength(lib.fptrs, length(parsed));
+			for i := 0 to High(parsed) do
+			begin
+				lib.fptrs[i] := parsed[i].funcPtr;
+				lib.fptrs[i]^ := GetProcAddress(lib.h, pChar(parsed[i].funcName));
+				if not Assigned(lib.fptrs[i]^) then
+					raise Exception.Create('Функция {} не найдена в {}.'.Format([parsed[i].funcName, fn]));
+			end;
+		except
+			lib.Unload;
+			raise;
+		end;
+	end;
+
+	procedure DLL.Unload;
+	var
+		i: SizeInt;
+	begin
+		for i := 0 to High(fptrs) do
+			if Assigned(fptrs[i]) then fptrs[i]^ := nil;
+		if (h <> 0) and not FreeLibrary(h) then Win32.Warning('FreeLibrary', GetLastError);
+		h := 0;
+	end;
 
 	function GetFileSizeEx(hFile: HANDLE; lpFileSize: PLARGE_INTEGER): Windows.BOOL; stdcall; external kernel32;
 	function BindIoCompletionCallback(FileHandle: Windows.HANDLE; func: LPOVERLAPPED_COMPLETION_ROUTINE; flags: Windows.ULONG): Windows.BOOL; stdcall; external kernel32;
 
-	class function Win32.DescribeError(code: DWORD = USE_GETLASTERROR): string; static;
+	class function Win32.ErrorCode.Create(value: dword; from: Origin): Win32.ErrorCode;
+	begin
+		result.value := value;
+		result.from := from;
+	end;
+
+	class procedure Win32.Init;
+	var
+		exe: string;
+		p: SizeInt;
+	begin
+		DLL.Load(k32, kernel32, ['CreateThreadpoolIo', @CreateThreadpoolIo, 'StartThreadpoolIo', @StartThreadpoolIo]);
+		exe := QueryString(QueryStringCallback(@Win32.QueryModuleFileName), nil, 'имени исполняемого файла').ToUTF8;
+		p := length(exe);
+		while (p > 0) and not (exe[p] in ['\', '/']) do dec(p);
+		ExecRoot := Copy(exe, 1, p);
+	end;
+
+	class procedure Win32.Done;
+	begin
+		k32.Unload;
+	end;
+
+	class function Win32.DescribeError(const code: ErrorCode): string; static;
 	var
 		werr: widestring;
-		ptr: pointer;
+		scode: string;
+		fflags: dword;
+		ptr, fsrc: pointer;
+		dll: im.DLL;
 	begin
-		CheckForUSE_GETLASTERROR(code);
-		if code = 0 then result := 'Причина неизвестна.' else
+		result := '';
+		if code.value = 0 then
+			result := 'Причина неизвестна.'
+		else
 		begin
-			if FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER or FORMAT_MESSAGE_FROM_SYSTEM or FORMAT_MESSAGE_IGNORE_INSERTS or FORMAT_MESSAGE_MAX_WIDTH_MASK, nil,
-				code, 0, pWideChar(@ptr), 0, nil) > 0 then
+			if code.from = code.Origin.NTSTATUS then dll.Load(dll, 'NTDLL.DLL', []);
+			fflags := FORMAT_MESSAGE_ALLOCATE_BUFFER or FORMAT_MESSAGE_FROM_SYSTEM or FORMAT_MESSAGE_IGNORE_INSERTS or FORMAT_MESSAGE_MAX_WIDTH_MASK;
+			fsrc := nil;
+			if code.from = code.Origin.NTSTATUS then
+			begin
+				fflags := fflags or FORMAT_MESSAGE_FROM_HMODULE;
+				pPtrUint(@fsrc)^ := dll.h;
+			end;
+			if FormatMessageW(fflags, fsrc, code.value, 0, pWideChar(@ptr), 0, nil) > 0 then
 			begin
 				werr := pWideChar(ptr);
 				if Assigned(ptr) then HeapFree(GetProcessHeap, 0, ptr);
 				result := werr.ToUTF8;
 				while (length(result) > 0) and (result[length(result)] = ' ') do SetLength(result, length(result) - 1);
-			end else
-				result := '';
-
-			if result = '' then exit('Нет текстового описания системной ошибки, код {}.'.Format([code]));
+			end;
+			if code.from = code.Origin.NTSTATUS then dll.Unload;
 		end;
-		result += ' ({})'.Format([code]);
+
+		if code.from = code.Origin.NTSTATUS then scode := HexStr(code.value, bitsizeof(Win32.NTSTATUS) div 4) else scode := ToString(code.value);
+		if result = '' then result := 'Ошибка с кодом {}.'.Format([scode]) else result += ' ({})'.Format([scode]);
 	end;
 
-	class function Win32.OperationFailed(const what: string; code: DWORD = USE_GETLASTERROR): Exception;
+	class function Win32.Error(const fmt: string; const args: array of const; const code: ErrorCode): Exception;
+	type
+		Shortcut = (TitleError, LowercaseError);
+	const
+		Shortcuts: array[Shortcut] of string = ('{Err.}', '{err.}');
+	var
+		i, p: SizeInt;
+		fmt2: string;
+		args2: array of TVarRec;
+		sc: Shortcut;
+		storage: array[Shortcut] of string;
+
 	begin
-		CheckForUSE_GETLASTERROR(code);
-		result := Exception.Create('Не удалось {}. {}'.Format([what, DescribeError(code)]));
+		fmt2 := fmt;
+		SetLength(args2, length(args));
+		for i := 0 to High(args2) do args2[i] := args[i];
+
+		for sc in Shortcut do
+		begin
+			p := Pos(Shortcuts[sc], fmt2);
+			if p > 0 then
+			begin
+				storage[sc] := DescribeError(code);
+				if sc = Shortcut.LowercaseError then storage[sc] := storage[sc].LowercaseFirst;
+				TVarRec(Ary(args2).Grow(sizeof(TVarRec))^).VType := vtAnsiString;
+				pointer(args2[High(args2)].VAnsiString) := pointer(storage[sc]);
+				fmt2 := fmt2.Stuffed(p, length(Shortcuts[sc]), '{{{}}'.Format([High(args2)]));
+			end;
+		end;
+		result := Exception.Create(fmt2.Format(args2));
 	end;
 
-	class function Win32.FileError(const fn: string; code: DWORD = USE_GETLASTERROR): Exception;
+	class function Win32.FileError(const fn: string; const code: ErrorCode): Exception;
 	begin
-		CheckForUSE_GETLASTERROR(code);
-		result := Exception.Create('{}: {}.'.Format([fn, DescribeError(code).LowercaseFirst]));
+		result := Error('{}: {err.}', [fn], code);
+	end;
+
+	class function Win32.OperationFailed(const what: string; const code: ErrorCode): Exception;
+	begin
+		result := Error('Не удалось {}: {err.}', [what], code);
 	end;
 
 	class function Win32.Lowercase(const text: string): string;
@@ -309,10 +566,9 @@ var
 		result := ws.ToUTF8;
 	end;
 
-	class procedure Win32.Warning(const what: string; code: DWORD = USE_GETLASTERROR);
+	class procedure Win32.Warning(const what: string; const code: ErrorCode);
 	begin
-		CheckForUSE_GETLASTERROR(code);
-		writeln(stderr, what, ': ', code);
+		writeln(stderr, what.ToUTF16, ': ', DescribeError(code).LowercaseFirst.ToUTF16);
 	end;
 
 	class function Win32.CommandLineTail: string;
@@ -332,9 +588,38 @@ var
 		delete(result, 1, i);
 	end;
 
-	class procedure Win32.CheckForUSE_GETLASTERROR(var code: DWORD);
+	class function Win32.QueryString(cb: QueryStringCallback; param: pointer; const ofWhat: string): widestring;
+	const
+		ReasonableLimit = 16383;
+	var
+		len, report: size_t;
 	begin
-		if code = USE_GETLASTERROR then code := GetLastError;
+		len := 64;
+		repeat
+			SetLength(result, len);
+			cb(pWideChar(result), len + ord(len > 0), report, param);
+			if report <= len then exit(Copy(result, 1, report));
+			if report = QUERY_STRING_LENGTH_UNKNOWN then
+			begin
+				if len = ReasonableLimit then raise Exception.Create('Неправдоподобная длина {}.'.Format([ofWhat]));
+				len := min(2 * len, SizeUint(ReasonableLimit));
+			end else
+			begin
+				if (report = len + 1) or (report - 1 > ReasonableLimit) then
+					raise Exception.Create('Получена неправдоподобная длина {} ({}).'.Format([ofWhat, len]));
+				len := report - 1;
+			end;
+		until false;
+	end;
+
+	class procedure Win32.QueryModuleFileName(buf: pWideChar; nBuf: size_t; out len: size_t; param: pointer);
+	var
+		r: dword;
+	begin
+		Assert(param = param);
+		r := GetModuleFileNameW(0, buf, nBuf);
+		if (r = 0) and (nBuf > 0) then raise OperationFailed('получить имя исполняемого файла (GetModuleFileName)', GetLastError);
+		if r >= nBuf then len := QUERY_STRING_LENGTH_UNKNOWN else len := r;
 	end;
 
 	procedure ThreadLock.Init;
@@ -355,16 +640,16 @@ var
 	procedure ThreadLock.Enter; begin EnterCriticalSection(cs); end;
 	procedure ThreadLock.Leave; begin LeaveCriticalSection(cs); end;
 
-	procedure ThreadEvent.Init(manual, initialState: boolean);
+	procedure ThreadEvent.Init(manual: boolean; initialState: boolean = false);
 	begin
 		Assert(h = 0);
 		h := CreateEventW(nil, manual, initialState, nil);
-		if h = 0 then raise Win32.OperationFailed('создать событие');
+		if h = 0 then raise Win32.OperationFailed('создать событие (CreateEvent)', GetLastError);
 	end;
 
 	procedure ThreadEvent.Done;
 	begin
-		if (h <> 0) and not CloseHandle(h) then Win32.Warning('CloseHandle');
+		if (h <> 0) and not CloseHandle(h) then Win32.Warning('CloseHandle', GetLastError);
 		h := 0;
 	end;
 
@@ -373,8 +658,8 @@ var
 		result := h <> 0;
 	end;
 
-	procedure ThreadEvent.&Set; begin if not SetEvent(h) then raise Win32.OperationFailed('выставить событие (SetEvent)'); end;
-	procedure ThreadEvent.Reset; begin if not ResetEvent(h) then raise Win32.OperationFailed('сбросить событие (ResetEvent)'); end;
+	procedure ThreadEvent.&Set; begin if not SetEvent(h) then raise Win32.OperationFailed('выставить событие (SetEvent)', GetLastError); end;
+	procedure ThreadEvent.Reset; begin if not ResetEvent(h) then raise Win32.OperationFailed('сбросить событие (ResetEvent)', GetLastError); end;
 	procedure ThreadEvent.Wait;
 	var
 		r: dword;
@@ -382,9 +667,9 @@ var
 		r := WaitForSingleObject(h, INFINITE);
 		if r <> WAIT_OBJECT_0 then
 			if r = WAIT_FAILED then
-				raise Win32.OperationFailed('подождать события (WaitForSingleObject)')
+				raise Win32.OperationFailed('подождать события (WaitForSingleObject)', GetLastError)
 			else
-				raise Exception.Create('WaitForSingleObject вернула {}'.format([r]));
+				raise Exception.Create('WaitForSingleObject вернула {}'.Format([r]));
 	end;
 
 	procedure Console.Init;
@@ -395,13 +680,13 @@ var
 		try
 			lock.Init;
 			if not SetConsoleCtrlHandler(PHANDLER_ROUTINE(@Console.CtrlHandler), true) then
-				raise Win32.OperationFailed('установить обработчик Ctrl-C (SetConsoleCtrlHandler)');
+				raise Win32.OperationFailed('установить обработчик Ctrl-C (SetConsoleCtrlHandler)', GetLastError);
 			handlerAdded := true;
 			hOut := CreateFile('CONOUT$',  GENERIC_READ or GENERIC_WRITE, FILE_SHARE_WRITE, nil, OPEN_EXISTING, 0, 0);
-			if hOut = INVALID_HANDLE_VALUE then raise Win32.OperationFailed('открыть дескриптор консоли для вывода');
+			if hOut = INVALID_HANDLE_VALUE then raise Win32.OperationFailed('открыть дескриптор консоли для вывода', GetLastError);
 			hOutSet := true;
 
-			if not GetConsoleScreenBufferInfo(hOut, (@info)^) then raise Win32.OperationFailed('получить информацию от консоли (GetConsoleScreenBufferInfo)');
+			if not GetConsoleScreenBufferInfo(hOut, (@info)^) then raise Win32.OperationFailed('получить информацию от консоли (GetConsoleScreenBufferInfo)', GetLastError);
 			defCol := BitsToColor[info.wAttributes and %1111];
 			defBg := BitsToColor[info.wAttributes shr 4 and %1111];
 			defAttrWoCol := info.wAttributes and not word(%11111111); // FOREGROUND_* и BACKGROUND_*
@@ -413,10 +698,10 @@ var
 
 	procedure Console.Done;
 	begin
-		if handlerAdded and not SetConsoleCtrlHandler(PHANDLER_ROUTINE(@Console.CtrlHandler), false) then Win32.Warning('SetConsoleCtrlHandler');
+		if handlerAdded and not SetConsoleCtrlHandler(PHANDLER_ROUTINE(@Console.CtrlHandler), false) then Win32.Warning('SetConsoleCtrlHandler', GetLastError);
 		handlerAdded := false;
-		if hOutSet and (hOut <> INVALID_HANDLE_VALUE) and not CloseHandle(hOut) then Win32.Warning('CloseHandle');
-		hOutSet := false;
+		if hOutSet and (hOut <> INVALID_HANDLE_VALUE) and not CloseHandle(hOut) then Win32.Warning('CloseHandle', GetLastError);
+		hOutSet := false; broken := false;
 		lock.Done;
 	end;
 	function Console.OK: boolean; begin result := lock.ok; end;
@@ -436,27 +721,27 @@ var
 			lock.Leave;
 		end;
 	end;
-	procedure Console.Line(const s: string); begin Write(s + LineEnding); end;
+	procedure Console.Line(const s: string); begin Write(s + EOL); end;
 
-	procedure Console.Colored(const s: string; cl: SizeInt = -1);
+	procedure Console.Colored(const s: string; baseCol: SizeInt = -1);
 	var
 		pieces: PiecesList;
 		i: SizeInt;
 		activeColor, newColor, activeBg, newBg: Color;
 	begin
+		pieces := ParseMarkdown(s);
 		if not hOutSet or broken then
 		begin
 			for i := 0 to High(pieces) do system.write(pieces[i].data);
 			exit;
 		end;
 
-		pieces := ParseMarkdown(s);
 		lock.Enter;
 		try
 			activeColor := defCol; activeBg := defBg;
 			for i := 0 to High(pieces) do
 			begin
-				if pieces[i].color >= 0 then newColor := Color(pieces[i].color) else if cl >= 0 then newColor := Color(cl) else newColor := defCol;
+				if pieces[i].color >= 0 then newColor := Color(pieces[i].color) else if baseCol >= 0 then newColor := Color(baseCol) else newColor := defCol;
 				if newColor = defBg then newBg := Color(ord(High(Color)) - ord(newColor)) else newBg := defBg;
 				if (activeColor <> newColor) or (activeBg <> defBg) then SetConsoleTextAttribute(hOut, defAttrWoCol or ColorToBits[newColor] or ColorToBits[newBg] shl 4);
 				activeColor := newColor;
@@ -468,11 +753,11 @@ var
 			lock.Leave;
 		end;
 	end;
-	procedure Console.Colored(const s: string; cl: Color); begin Colored(s, ord(cl)); end;
-	procedure Console.ColoredLine(const s: string); begin Colored(s + LineEnding); end;
-	procedure Console.ColoredLine(const s: string; cl: Color); begin Colored(s + LineEnding, cl); end;
+	procedure Console.Colored(const s: string; baseCol: Color); begin Colored(s, ord(baseCol)); end;
+	procedure Console.ColoredLine(const s: string); begin Colored(s + EOL); end;
+	procedure Console.ColoredLine(const s: string; baseCol: Color); begin Colored(s + EOL, baseCol); end;
 
-	function Console.Escape(const s: string): string;
+	class function Console.Escape(const s: string): string;
 	var
 		start, i: SizeInt;
 	begin
@@ -533,7 +818,7 @@ var
 						end;
 						if s.Prefixed('/>', i + 1) then
 						begin
-							if csp = 0 then raise Exception.Create('{}: антипереполнение стека цветов.'.Format([s.Stuffed(i, '|')]));
+							if csp = 0 then raise Exception.Create('{}: антипереполнение стека цветов.'.Format([s.Stuffed(i, 0, '|')]));
 							Append(start, i - start, colorStack[csp]);
 							dec(csp);
 							start := i + 3; i := start; goto nextsym;
@@ -565,10 +850,43 @@ var
 		ws := text.ToUTF16; p := pWideChar(ws);
 		repeat
 			n := min(length(ws) - (p - pWideChar(ws)), BlockSize);
-			if not WriteConsoleW(hOut, p, n, (@written)^, nil) then begin broken := true; raise Win32.OperationFailed('WriteConsoleW'); end;
+			if not WriteConsoleW(hOut, p, n, (@written)^, nil) then begin broken := true; raise Win32.OperationFailed('WriteConsoleW', GetLastError); end;
 			if written <> n then begin broken := true; raise Exception.Create('WriteConsoleW: n = {}, written = {}.'.Format([n, written])); end;
 			p += n;
 		until p = pWideChar(ws) + length(ws);
+	end;
+
+	function &File.IOStatus.OK: boolean; begin result := (code.value = 0) and (transferred = pIORequest(req)^.size); end;
+	function &File.IOStatus.Partial: boolean; begin result := (code.value = 0) and (transferred <= pIORequest(req)^.size); end;
+	function &File.IOStatus.Cancelled: boolean;
+	begin
+		result := (code.from = code.Origin.GetLastError) and (code.value = ERROR_OPERATION_ABORTED) or
+			(code.from = code.Origin.NTSTATUS) and (code.value = Win32.STATUS_CANCELLED);
+	end;
+	function &File.IOStatus.Failed: boolean; begin result := code.value <> 0; end;
+
+	function &File.IOStatus.ToException: Exception;
+	const
+		Fmt: array[boolean] of string = ('Из {} прочитано {} b (вместо {} b).', 'В {} записались {} b (вместо {} b).');
+		RW: array[boolean] of string = ('чтения', 'записи');
+	var
+		c2: Win32.ErrorCode;
+	begin
+		if (code.value = 0) and (transferred < pIORequest(req)^.size) then
+			result := Exception.Create(Fmt[pIORequest(req)^.write].Format([pIORequest(req)^.h^.fn, transferred, pIORequest(req)^.size]))
+		else
+		begin
+			if code.value = STRANGE_ERROR then c2 := 0 else c2 := code;
+			result := Win32.Error('Ошибка {} {}: {err.}', [RW[pIORequest(req)^.write], pIORequest(req)^.h^.fn], c2);
+		end;
+	end;
+
+	class function &File.IOStatus.Create(req: pointer; const code: Win32.ErrorCode; const transferred: transferred_t; forceFail: boolean = false): IOStatus;
+	begin
+		result.req := req;
+		result.code := code;
+		if forceFail and (code.value = 0) then result.code.value := STRANGE_ERROR;
+		result.transferred := transferred;
 	end;
 
 	class procedure &File.Open(out f: &File; const fn: string; flags: Flags; r: pOpenResult = nil);
@@ -580,17 +898,17 @@ var
 		ok: boolean;
 		rb: PathRollback;
 	begin
-		if not HeyNoAsioPending.OK then
+		f.ref := nil;
+		if not HeyNoIOPending.OK then
 		begin
 			SingletonLock.Enter;
 			try
-				if not HeyNoAsioPending.OK then GlobalInitialize;
+				if not HeyNoIOPending.OK then GlobalInitialize;
 			finally
 				SingletonLock.Leave;
 			end;
 		end;
 
-		f.ref := nil;
 		if Assigned(r) then r^ := OpenResult.Empty;
 		rb := rb.Empty;
 
@@ -648,55 +966,31 @@ var
 		ref^.Close(ref);
 	end;
 
-	procedure &File.Read(at: FilePos; buf: pointer; size: SizeUint);
-	var
-		a: pAsyncIORequest;
-		actual, code: dword;
-		rfOk: boolean;
+	procedure &File.Invalidate; begin ref := nil; end;
+	function &File.Valid: boolean; begin result := Assigned(ref); end;
+
+	procedure &File.Read(const at: FilePos; buf: pointer; size: SizeUint; onDone: CompletionHandler = nil; param: pointer = nil);
 	begin
-		a := CreateAsyncIORequest(ref, at, 0);
-		rfOk := Windows.ReadFile(ref^.h, buf^, size, (@actual)^, @a^.ov);
-		if not rfOk then code := GetLastError;
-		if rfOk or (code = ERROR_IO_PENDING) then
-		begin
-			if not rfOk and not GetOverlappedResult(ref^.h, a^.ov, actual, true) then
-			begin
-				code := GetLastError;
-				raise Win32.FileError(ref^.fn, code);
-			end;
-			if actual <> size then raise Exception.Create('Из {} прочитано {} b (вместо {} b).'.Format([ref^.fn, actual, size]));
-		end else
-		begin
-			CloseAsyncIORequest(a);
-			raise Win32.FileError(ref^.fn, code);
-		end;
+		IO(false, at, buf, size, onDone, param);
 	end;
 
-	procedure &File.Write(at: FilePos; buf: pointer; size: SizeUint);
-	var
-		a: pAsyncIORequest;
-		actual, code: dword;
-		wfOk: boolean;
-	begin
-		a := CreateAsyncIORequest(ref, at, size);
-		Move(buf^, a^.data[0], size);
 
-		wfOk := WriteFile(ref^.h, a^.data[0], size, (@actual)^, @a^.ov);
-		if not wfOk then code := GetLastError;
-		if wfOk then
-			if actual <> size then raise Exception.Create('В {} записалось {} b (вместо {} b).'.Format([ref^.fn, actual, size])) else
-		else if code <> ERROR_IO_PENDING then
-		begin
-			CloseAsyncIORequest(a);
-			raise Win32.FileError(ref^.fn, code);
-		end;
+	procedure &File.Write(const at: FilePos; buf: pointer; size: SizeUint; onDone: CompletionHandler = nil; param: pointer = nil);
+	begin
+		IO(true, at, buf, size, onDone, param);
 	end;
 
 	function &File.Size: FileSize;
 	var
 		sz: LARGE_INTEGER;
 	begin
-		if GetFileSizeEx(ref^.h, @sz) then result := sz.QuadPart else raise Win32.OperationFailed('получить размер файла (GetFileSizeEx)');
+		if GetFileSizeEx(ref^.h, @sz) then result := sz.QuadPart else raise Win32.OperationFailed('получить размер файла (GetFileSizeEx)', GetLastError);
+	end;
+
+	procedure &File.CancelMyIORequests;
+	begin
+		if not CancelIO(ref^.h) then
+			raise Exception.Create('{}: не удалось отменить I/O (CancelIO), {}.'.Format([ref^.fn, Win32.DescribeError(GetLastError).LowercaseFirst]));
 	end;
 
 	class function &File.SharedHandle.Create(h: HANDLE; const fn: string): pSharedHandle;
@@ -741,7 +1035,7 @@ var
 		i: SizeInt;
 	begin
 		for i := High(folders) downto 0 do
-			if not RemoveDirectoryW(pWideChar(folders[i])) then Win32.Warning('RemoveDirectoryW');
+			if not RemoveDirectoryW(pWideChar(folders[i])) then Win32.Warning('RemoveDirectoryW', GetLastError);
 		folders := nil;
 	end;
 
@@ -778,46 +1072,112 @@ var
 	end;
 
 	class procedure &File.IOCompletionHandler(dwErrorCode: dword; dwNumberOfBytesTransfered: dword; lpOverlapped: Windows.LPOVERLAPPED); stdcall;
+	var
+		req: pIORequest absolute lpOverlapped;
 	begin
-		Assert((dwErrorCode = dwErrorCode) and (dwNumberOfBytesTransfered = dwNumberOfBytesTransfered));
-		CloseAsyncIORequest(pAsyncIORequest(lpOverlapped));
+		CloseIORequest(req, IOStatus.Create(req, Win32.NTSTATUS(dwErrorCode), dwNumberOfBytesTransfered));
 	end;
 
-	class function &File.CreateAsyncIORequest(h: pSharedHandle; const offset: FilePos; extraSize: SizeUint): pAsyncIORequest;
+	class function &File.CreateIORequest(h: pSharedHandle; const offset: FilePos; size, extraSize: SizeUint; write: boolean; onDone: CompletionHandler; param: pointer): pIORequest;
 	begin
-		if InterlockedIncrement(AsioPending) = 1 then HeyNoAsioPending.Reset;
-		result := GetMem(sizeof(AsyncIORequest) - sizeof(AsyncIORequest.data) + extraSize);
+		if InterlockedIncrement(IOPending) = 1 then HeyNoIOPending.Reset;
+		result := GetMem(sizeof(IORequest) - sizeof(IORequest.data) + extraSize);
 		result^.ov.Internal     := 0;
 		result^.ov.InternalHigh := 0;
 		result^.ov.hEvent       := 0;
 		result^.ov.Offset       := Lo(offset);
 		result^.ov.OffsetHigh   := Hi(offset);
 		result^.h := h^.Ref;
+		result^.size := size;
+		result^.write := write;
+		result^.onDone := onDone;
+		result^.param  := param;
 	end;
 
-	class procedure &File.CloseAsyncIORequest(a: pAsyncIORequest);
+	class procedure &File.CloseIORequest(a: pIORequest; const status: IOStatus);
 	begin
+		// try ... except Die, как вариант.
+		a^.onDone(status, a^.param);
+
+		// Нельзя закрывать до onDone. onDone иногда смотрит внутрь a^.h, например, чтобы узнать имя файла для сообщения об ошибке.
 		a^.h^.Close(a^.h);
+
 		FreeMem(a);
-		if InterlockedDecrement(AsioPending) = 0 then HeyNoAsioPending.&Set;
+		if InterlockedDecrement(IOPending) = 0 then HeyNoIOPending.&Set;
+	end;
+
+	procedure &File.IO(write: boolean; const at: FilePos; buf: pointer; size: SizeUint; onDone: CompletionHandler; param: pointer);
+	const
+		GenOp: array[boolean] of string = ('чтения', 'записи');
+		function ExtraSize: SizeUint; begin if write then result := size else result := 0; end;
+	var
+		a: pIORequest;
+		transferred: dword;
+		ok, onDoneWasSet: boolean;
+		syncExc: Exception;
+	begin
+		// Запросы без onDone считаются синхронными.
+		// В этом случае используется вспомогательный onDone, который, возможно, запишет ошибку в syncExc.
+		// Если запишет — она бросается в вызывающего.
+		onDoneWasSet := Assigned(onDone);
+		syncExc := nil;
+		if not Assigned(onDone) then
+		begin
+			onDone := CompletionHandler(@&File.OnDoneSync);
+			param  := @syncExc;
+		end;
+
+		// Если это запись — выделить вместе с IORequest временную область и скопировать в неё данные буфера.
+		// Если чтение — за целостность буфера на протяжении операции отвечает вызывающий.
+		a := CreateIORequest(ref, at, size, ExtraSize, write, onDone, param);
+		if write then Move(buf^, a^.data[0], size);
+
+		if write then
+			ok := WriteFile(ref^.h, a^.data[0], size, dword(nil^), @a^.ov)
+		else
+			ok := ReadFile(ref^.h, buf^, size, dword(nil^), @a^.ov);
+
+		if ok then
+		begin
+			// Операция завершилась синхронно, IOCompletionHandler выполнен.
+
+		end else if GetLastError = ERROR_IO_PENDING then
+		begin
+			// Операция начата асинхронно, IOCompletionHandler когда-нибудь выполнится.
+			// Если это чтение и не задан onDone, подождать завершения.
+			// Если это запись, никогда не ждать. Без onDone получится fire-and-forget реквест.
+			// (Может быть, я изменю это на полностью синхронный вариант, как с чтением — тогда extraSize можно будет убрать).
+			if not write and not onDoneWasSet then
+				if not GetOverlappedResult(ref^.h, a^.ov, (@transferred)^, true) then raise Win32.Error('Не удалось получить результат {} {}. {Err.}', [GenOp[write], ref^.fn], GetLastError);
+
+		end else
+			// Операция провалилась, IOCompletionHandler не выполнен и не будет.
+			CloseIORequest(a, IOStatus.Create(a, GetLastError, 0, true));
+
+		if Assigned(syncExc) then raise syncExc;
+	end;
+
+	class procedure &File.OnDoneSync(const status: IOStatus; param: pointer);
+	begin
+		if not status.OK then Exception(param^) := status.ToException;
 	end;
 
 	class procedure &File.GlobalInitialize;
 	begin
-		if HeyNoAsioPending.OK then raise LogicError.Create('File.GlobalInitialize уже вызвана.');
-		HeyNoAsioPending.Init(true, true);
+		if HeyNoIOPending.OK then raise LogicError.Create('File.GlobalInitialize уже вызвана.');
+		HeyNoIOPending.Init(true, true);
 		AddExitProc(TProcedure(@&File.GlobalFinalize));
 	end;
 
 	class procedure &File.GlobalFinalize;
 	begin
 		WaitForAllIORequests;
-		HeyNoAsioPending.Done;
+		HeyNoIOPending.Done;
 	end;
 
 	class procedure &File.WaitForAllIORequests;
 	begin
-		if HeyNoAsioPending.OK then HeyNoAsioPending.Wait;
+		if HeyNoIOPending.OK then HeyNoIOPending.Wait;
 	end;
 
 	function fpc_addref(data, typeInfo: pointer): SizeInt; [external name 'FPC_ADDREF'];
@@ -893,15 +1253,15 @@ var
 		if length(self) - pos + 1 > 0 then result := UTFchar(self[pos]) else begin len := 0; exit(UTFInvalid); end;
 		if result <= %01111111 then len := 1
 		{$define n_more :=
-			(1 + n <= length(self) - pos + 1) {$define times := n} {$define rep := and (ord(self[pos + (1 + repid)]) shr 6 = %10)} pp_repeat then
+			{$define times := n} {$define rep := and (ord(pChar(self)[pos + (1 + repid) - 1]) shr 6 = %10)} pp_repeat then
 			begin
 				result := (result and (%00011111 shr (n-1))) shl (6*n)
-						{$define rep := or (UTFchar(ord(self[pos + (1+repid)]) and %00111111) shl (6*(n-1-repid)))} {$define times := n} pp_repeat;
+						{$define rep := or (UTFchar(ord(self[pos + (1 + repid)]) and %00111111) shl (6*(n-1-repid)))} {$define times := n} pp_repeat;
 				len := n + 1;
 			end {$undef n}}
-		else if (result >= %11000000) and (result <= %11011111) and {$define n := 1} n_more
-		else if (result >= %11100000) and (result <= %11101111) and {$define n := 2} n_more
-		else if (result >= %11110000) and (result <= %11110111) and {$define n := 3} n_more
+		else if (result >= %11000000) and (result <= %11011111) {$define n := 1} n_more
+		else if (result >= %11100000) and (result <= %11101111) {$define n := 2} n_more
+		else if (result >= %11110000) and (result <= %11110111) {$define n := 3} n_more
 		{$undef n_more} else begin len := 0; exit(UTFInvalid); end;
 	end;
 
@@ -930,7 +1290,7 @@ var
 				'{':
 					if (p + 1 <= length(self)) and (self[p + 1] = '{') then
 					begin
-						inc(p); result += Copy(self, start, p - start); start := p;
+						result += Copy(self, start, p + 1 - start); inc(p, 2); start := p;
 					end else
 					begin
 						nn := p + 1;
@@ -940,7 +1300,7 @@ var
 								TryParse(Copy(self, p + 1, nn - p - 1), index) and (index >= 0) and (index < length(args))) then
 						begin
 							if nn = p + 1 then begin index := next; inc(next); end;
-							result += Copy(self, start, p - start) + ToString(args[index]); p := nn + 1; start := p;
+							result += Copy(self, start, p - start) + VarRec.ToString(args[index]); p := nn + 1; start := p;
 						end else
 							inc(p);
 					end;
@@ -950,7 +1310,53 @@ var
 		result += Copy(self, start, p - start);
 	end;
 
-	class function StringHelper.ToString(const v: TVarRec): string;
+	function StringHelper.Prefixed(const p: string; pos: SizeInt = 1): boolean;
+	begin
+		result := (pos + length(p) - 1 <= length(self)) and (CompareChar(self[pos], p[1], length(p)) = 0);
+	end;
+
+	function StringHelper.Tail(start: SizeInt): string;
+	begin
+		result := Copy(self, start, length(self) - start + 1);
+	end;
+
+	function StringHelper.Lowercase: string; begin result := Win32.Lowercase(self); end;
+	function StringHelper.LowercaseFirst: string;
+	var
+		n: SizeInt;
+	begin
+		if length(self) >= 1 then n := CodepointLen(1) else n := 0;
+		result := Copy(self, 1, n).Lowercase + Copy(self, n + 1, length(self) - n);
+	end;
+
+	function StringHelper.Stuffed(at, remove: SizeInt; const &with: string): string;
+	begin
+		remove := min(remove, length(self) - at + 1);
+		result := Copy(self, 1, at - 1) + &with + Copy(self, at + remove, length(self) - at - remove + 1);
+	end;
+	function StringHelper.AR: PAnsiRec; begin result := PAnsiRec(self) - 1; end;
+
+	function WidestringHelper.ToUTF8: string;
+	begin
+		result := UTF8Encode(self);
+		if Assigned(pointer(result)) then result.AR^.cpes.CodePage := CP_ACP;
+	end;
+
+	class procedure VarRec.AssertType(const v: TVarRec; expected: SizeInt; pos: SizeInt);
+	begin
+		if v.VType <> expected then
+			raise LogicError.Create('В позиции {} vt = {}, ожидается {}.'.Format([pos, VTypeToString(v.VType), VTypeToString(expected)]));
+	end;
+
+	class function VarRec.VTypeToString(vt: SizeInt): string;
+	const
+		Known: array[0 .. 18] of string = ('Integer', 'Boolean', 'Char', 'Extended', 'String', 'Pointer', 'PChar', 'Object', 'Class', 'WideChar',
+		'PWideChar', 'AnsiString', 'Currency', 'Variant', 'Interface', 'WideString', 'Int64', 'QWord', 'UnicodeString');
+	begin
+		if vt < length(Known) then result := 'vt{} ({})'.Format([Known[vt], vt]) else result := '? ({})'.Format([vt]);
+	end;
+
+	class function VarRec.ToString(const v: TVarRec): string;
 	begin
 		case v.VType of
 			vtInteger: result := im.ToString(v.VInteger);
@@ -964,34 +1370,8 @@ var
 			vtAnsiString: result := ansistring(v.VAnsiString);
 			vtInt64:      result := im.ToString(v.VInt64^);
 			vtQWord:      result := im.ToString(v.VQWord^);
-			else          result := '(VType ' + im.ToString(v.VType) + ')';
+			else          result := '(vt = {})'.Format([VTypeToString(v.VType)]);
 		end;
-	end;
-
-	function StringHelper.Prefixed(const p: string; pos: SizeInt = 1): boolean;
-	begin
-		result := (pos + length(p) - 1 <= length(self)) and (CompareChar(self[pos], p[1], length(p)) = 0);
-	end;
-
-	function StringHelper.Lowercase: string; begin result := Win32.Lowercase(self); end;
-	function StringHelper.LowercaseFirst: string;
-	var
-		n: SizeInt;
-	begin
-		if length(self) >= 1 then n := CodepointLen(1) else n := 0;
-		result := Copy(self, 1, n).Lowercase + Copy(self, n + 1, length(self) - n);
-	end;
-
-	function StringHelper.Stuffed(at: SizeInt; const &with: string): string;
-	begin
-		result := Copy(self, 1, at - 1) + &with + Copy(self, at, length(self) - at + 1);
-	end;
-   function StringHelper.AR: PAnsiRec; begin result := PAnsiRec(self) - 1; end;
-
-	function WidestringHelper.ToUTF8: string;
-	begin
-		result := UTF8Encode(self);
-		if Assigned(pointer(result)) then result.AR^.cpes.CodePage := CP_ACP;
 	end;
 
 	constructor Exception.Create(const msg: string);
@@ -1010,16 +1390,22 @@ var
 	end;
 
 	procedure OutOfMemory.FreeInstance; begin ReleaseReserve; if Instance = self then Instance := nil; inherited; end;
-	procedure OutOfMemory.FireAnEmergency; begin ReleaseReserve; CanDieNow := true; end;
-	procedure OutOfMemory.ReleaseReserve; begin if Assigned(RainyDayReserve) then FreeMem(RainyDayReserve); RainyDayReserve := nil; end;
+	procedure OutOfMemory.FireAnEmergency; begin ReleaseReserve; end;
+	procedure OutOfMemory.ReleaseReserve;
+	begin
+		if SingletonLock.OK then SingletonLock.Enter;
+		if Assigned(RainyDayReserve) then FreeMem(RainyDayReserve);
+		RainyDayReserve := nil;
+		if SingletonLock.OK then SingletonLock.Leave;
+	end;
 
-	class constructor OutOfMemory.InitGlobal;
+	class procedure OutOfMemory.InitGlobal;
 	begin
 		Instance := OutOfMemory.Create;
 		Instance.RainyDayReserve := GetMem(4096);
 	end;
 
-	class destructor OutOfMemory.DoneGlobal;
+	class procedure OutOfMemory.DoneGlobal;
 	begin
 		if Assigned(Instance) then
 		begin
@@ -1034,6 +1420,8 @@ var
 		ExceptProc := TExceptProc(@Session.OnUnhandledException);
 		ErrorProc  := TErrorProc(@Session.OnRuntimeError);
 		AddExitProc(@DoneSession); // иначе не вызовется при сбое инициализации
+		OutOfMemory.InitGlobal;
+		Win32.Init;
 		SingletonLock.Init;
 		Con.Init;
 		TestHacks;
@@ -1044,6 +1432,8 @@ var
 		&File.WaitForAllIORequests;
 		Con.Done;
 		SingletonLock.Done;
+		Win32.Done;
+		OutOfMemory.DoneGlobal;
 	end;
 
 	class function Session.HumanTrace(frames: pCodePointer = nil; frameCount: SizeInt = -1): string;
@@ -1057,19 +1447,19 @@ var
 		var
 			p: SizeInt;
 		begin
-			p := 1;
-			while (p <= length(line)) and (line[p] in [StringHelper.Tab, ' ']) do inc(p);
-			while (p <= length(line)) and (line[p] in ['$']) do inc(p);
-			while (p <= length(line)) and (line[p] in ['0' .. '9']) do inc(p);
+			p := 0;
+			while (pChar(line)[p] in [StringHelper.Tab, ' ']) do inc(p);
+			while (pChar(line)[p] in ['$']) do inc(p);
+			while (pChar(line)[p] in ['0' .. '9', StringHelper.Tab, ' ']) do inc(p);
 			result := p < length(line);
 		end;
 	var
-		i: longint;
+		i: SizeInt;
 		line: string;
 		frame: CodePointer;
 		trace: array of TraceItem;
 	begin
-		trace := nil;
+		trace := nil; frame := nil;
 		i := 0;
 		repeat
 			if frameCount >= 0 then
@@ -1102,10 +1492,10 @@ var
 			for i := 0 to High(trace) do
 				if trace[i].uninteresting > 0 then
 				begin
-					result += LineEnding + '(...)';
+					result += EOL + '(...)';
 					if trace[i].uninteresting > 1 then result += ' x{}'.Format([trace[i].uninteresting]);
 				end else
-					result += LineEnding + trace[i].line;
+					result += EOL + trace[i].line;
 	end;
 
 	class procedure Session.OnUnhandledException(Obj: TObject; Addr: CodePointer; FrameCount: LongInt; Frame: PCodePointer);
@@ -1121,12 +1511,11 @@ var
 		readln;
 
 		// А этот хак настолько грязный, что нельзя легко проверить его состоятельность при недокументированных изменениях в RTL
-		// (к счастью, альтернатива есть: не заморачиваться и сделать сеппуку aka ExitProcess). Дело вот в чём.
+		// (к счастью, всегда есть альтернатива: не заморачиваться и сделать сеппуку aka ExitProcess). Дело вот в чём.
 		//
 		// Если ExceptProc вернулась, RTL вызывает halt, которая несколько мягче ExitProcess: она выполняет финализацию,
 		// давая отработать class destructor'ам, ExitProc и секциям finalization, в т. ч. в heaptrc.
-		// Поэтому я целенаправленно возвращаюсь из ExceptProc, чтобы дать всему этому отработать и проверить корректность и
-		// отсутствие утечек памяти даже после необработанного исключения.
+		// Поэтому я целенаправленно возвращаюсь из ExceptProc, чтобы проверить код на корректность и отсутствие утечек даже в аварийной ситуации.
 		//
 		// Но FPC сам не освобождает все внутренние структуры! А именно, узлы стека исключений (RaiseList), внутри которых, в свою очередь,
 		// языковые объекты исключений (FObject: TObject) и динамически выделенные блоки Frames.
@@ -1150,11 +1539,12 @@ var
 		Assert(Address = Address);
 		if ErrNo = RuntimeErrorExitCodes[reOutOfMemory] then raise OutOfMemory.Instance;
 
-		i := {$if sizeof(ErrNo) <> sizeof(dword)} {$error} {$endif} IndexDWord(RuntimeErrorExitCodes, length(RuntimeErrorExitCodes), dword(ErrNo));
+		i := -1;
+		if ErrNo <= High(byte) then i := IndexByte(RuntimeErrorExitCodes, length(RuntimeErrorExitCodes), ErrNo);
 		if i >= 0 then
 		begin
 			str(TRuntimeError(i), name);
-			if name.Prefixed('re') then delete(name, 1, length('re'));
+			if name.Prefixed('re') then name := name.Tail(length('re') + 1);
 		end else
 			name := 'с кодом ' + ToString(ErrNo);
 		raise Exception.Create('Произошла ошибка {}.'.Format([name]) + HumanTrace(@Frame));
@@ -1210,8 +1600,192 @@ var
 		TestDynArrayHack;
 	end;
 
+type
+	LodePNGLib = object(DLL)
+		procedure Load(const fn: string);
+	type
+		reallocf = function(p: pointer; nsize: csize_t): pointer; cdecl;
+		Allocator = record
+			realloc: reallocf;
+		end;
+
+		CompressionSettings = record
+			btype: cuint;        // the block type for LZ (0, 1, 2 or 3, see zlib standard). Should be 2 for proper compression.
+			use_lz77: cuint;     // whether or not to use LZ77. Should be 1 for proper compression.
+			windowsize: cuint;   // must be a power of two <= 32768. higher compresses more but is slower. Default value: 2048.
+			minmatch: cuint;     // mininum lz77 length. 3 is normally best, 6 can be better for some PNGs. Default: 0
+			nicematch: cuint;    // stop searching if >= this length found. Set to 258 for best compression. Default: 128
+			lazymatching: cuint; // use lazy matching: better compression but a bit slower. Default: true
+		end;
+		{$define enum := Preset} {$define items := Fast _ 0 _ Good _ 1 _ Uber _ 2} declare_scoped_enum_with_shortcuts
+
+	const
+		CT_GREY = 0;       // greyscale: 1, 2, 4, 8, 16 bit
+		CT_RGB = 2;        // RGB: 8, 16 bit
+		CT_PALETTE = 3;    // palette: 1, 2, 4, 8 bit
+		CT_GREY_ALPHA = 4; // greyscale with alpha: 8, 16 bit
+		CT_RGBA = 6;       // RGB with alpha: 8, 16 bit
+
+		Presets: array[Preset] of CompressionSettings = (
+			(btype: 1; use_lz77: 1; windowsize: 1024; minmatch: 3; nicematch: 128; lazymatching: 1),
+			(btype: 2; use_lz77: 1; windowsize: 2048; minmatch: 3; nicematch: 128; lazymatching: 1),
+			(btype: 2; use_lz77: 1; windowsize: 32768; minmatch: 3; nicematch: 258; lazymatching: 1));
+
+	var
+		decode_memory: function(out &out: pointer; out w, h: cuint; &in: pointer; insize: csize_t; colortype: cint; bitdepth: cuint;
+			constref alloc: Allocator): cuint; cdecl;
+		encode_memory: function(out &out: pointer; out outsize: csize_t; image: pointer; w, h: cuint; colortype: cint; bitdepth: cuint;
+			constref settings: CompressionSettings; constref alloc: Allocator): cuint; cdecl;
+
+		class function LodeReAlloc(p: pointer; nsize: csize_t): pointer; cdecl; static;
+		class function DefaultAllocator: Allocator; static;
+		class function ErrorMessage(code: cuint): string; static;
+	end;
+
+	procedure LodePNGLib.Load(const fn: string);
+	begin
+		DLL.Load(DLL(pointer(@self)^), fn, ['prefix=lodepng_', 'decode_memory', @decode_memory, 'encode_memory', @encode_memory]);
+	end;
+
+	class function LodePNGLib.LodeReAlloc(p: pointer; nsize: csize_t): pointer; cdecl;
+	begin
+		result := ReallocMem((@p)^, nsize);
+	end;
+
+	class function LodePNGLib.DefaultAllocator: Allocator;
+	begin
+		result.realloc := reallocf(@LodePNGLib.LodeReAlloc);
+	end;
+
+	// потом поставлю студию и вкомпилирую lodepng_error_text >___<"
+	class function LodePNGLib.ErrorMessage(code: cuint): string;
+	var
+		msg: string;
+	begin
+		msg := '';
+		case code of
+			1: msg := 'nothing done yet'; // the Encoder/Decoder has done nothing yet, error checking makes no sense yet
+			10: msg := 'end of input memory reached without huffman end code'; // while huffman decoding
+			11: msg := 'error in code tree made it jump outside of huffman tree'; // while huffman decoding
+			13: msg := 'problem while processing dynamic deflate block';
+			14: msg := 'problem while processing dynamic deflate block';
+			15: msg := 'problem while processing dynamic deflate block';
+			16: msg := 'unexisting code while processing dynamic deflate block';
+			17: msg := 'end of out buffer memory reached while inflating';
+			18: msg := 'invalid distance code while inflating';
+			19: msg := 'end of out buffer memory reached while inflating';
+			20: msg := 'invalid deflate block BTYPE encountered while decoding';
+			21: msg := 'NLEN is not ones complement of LEN in a deflate block';
+			// end of out buffer memory reached while inflating:
+			// This can happen if the inflated deflate data is longer than the amount of bytes required to fill up
+			// all the pixels of the image, given the color depth and image dimensions. Something that doesn't
+			// happen in a normal, well encoded, PNG image.
+			22: msg := 'end of out buffer memory reached while inflating';
+			23: msg := 'end of in buffer memory reached while inflating';
+			24: msg := 'invalid FCHECK in zlib header';
+			25: msg := 'invalid compression method in zlib header';
+			26: msg := 'FDICT encountered in zlib header while it''s not used for PNG';
+			27: msg := 'PNG file is smaller than a PNG header';
+			28: msg := 'incorrect PNG signature, it''s no PNG or corrupted'; // Checks the magic file header, the first 8 bytes of the PNG file
+			29: msg := 'first chunk is not the header chunk';
+			30: msg := 'chunk length too large, chunk broken off at end of file';
+			31: msg := 'illegal PNG color type or bpp';
+			32: msg := 'illegal PNG compression method';
+			33: msg := 'illegal PNG filter method';
+			34: msg := 'illegal PNG interlace method';
+			35: msg := 'chunk length of a chunk is too large or the chunk too small';
+			36: msg := 'illegal PNG filter type encountered';
+			37: msg := 'illegal bit depth for this color type given';
+			38: msg := 'the palette is too big'; // more than 256 colors
+			39: msg := 'more palette alpha values given in tRNS chunk than there are colors in the palette';
+			40: msg := 'tRNS chunk has wrong size for greyscale image';
+			41: msg := 'tRNS chunk has wrong size for RGB image';
+			42: msg := 'tRNS chunk appeared while it was not allowed for this color type';
+			43: msg := 'bKGD chunk has wrong size for palette image';
+			44: msg := 'bKGD chunk has wrong size for greyscale image';
+			45: msg := 'bKGD chunk has wrong size for RGB image';
+			48: msg := 'empty input buffer given to decoder. Maybe caused by non-existing file?';
+			49: msg := 'jumped past memory while generating dynamic huffman tree';
+			50: msg := 'jumped past memory while generating dynamic huffman tree';
+			51: msg := 'jumped past memory while inflating huffman block';
+			52: msg := 'jumped past memory while inflating';
+			53: msg := 'size of zlib data too small';
+			54: msg := 'repeat symbol in tree while there was no value symbol yet';
+			// jumped past tree while generating huffman tree, this could be when the
+			// tree will have more leaves than symbols after generating it out of the
+			// given lenghts. They call this an oversubscribed dynamic bit lengths tree in zlib.
+			55: msg := 'jumped past tree while generating huffman tree';
+			56: msg := 'given output image colortype or bitdepth not supported for color conversion';
+			57: msg := 'invalid CRC encountered (checking CRC can be disabled)';
+			58: msg := 'invalid ADLER32 encountered (checking ADLER32 can be disabled)';
+			59: msg := 'requested color conversion not supported';
+			60: msg := 'invalid window size given in the settings of the encoder (must be 0-32768)';
+			61: msg := 'invalid BTYPE given in the settings of the encoder (only 0, 1 and 2 are allowed)';
+			// LodePNG leaves the choice of RGB to greyscale conversion formula to the user.
+			62: msg := 'conversion from color to greyscale not supported';
+			63: msg := 'length of a chunk too long, max allowed for PNG is 2147483647 bytes per chunk'; // (2^31-1)
+			// this would msg in the inability of a deflated block to ever contain an end code. It must be at least 1.
+			64: msg := 'the length of the END symbol 256 in the Huffman tree is 0';
+			66: msg := 'the length of a text chunk keyword given to the encoder is longer than the maximum of 79 bytes';
+			67: msg := 'the length of a text chunk keyword given to the encoder is smaller than the minimum of 1 byte';
+			68: msg := 'tried to encode a PLTE chunk with a palette that has less than 1 or more than 256 colors';
+			69: msg := 'unknown chunk type with ''critical'' flag encountered by the decoder';
+			71: msg := 'unexisting interlace mode given to encoder (must be 0 or 1)';
+			72: msg := 'while decoding, unexisting compression method encountering in zTXt or iTXt chunk (it must be 0)';
+			73: msg := 'invalid tIME chunk size';
+			74: msg := 'invalid pHYs chunk size';
+			75: msg := 'no null termination char found while decoding text chunk'; // length could be wrong, or data chopped off
+			76: msg := 'iTXt chunk too short to contain required bytes';
+			77: msg := 'integer overflow in buffer size'; // 78, 79
+			80: msg := 'tried creating a tree of 0 symbols';
+			81: msg := 'lazy matching at pos 0 is impossible';
+			82: msg := 'color conversion to palette requested while a color isn''t in palette';
+			83: msg := 'memory allocation failed';
+			84: msg := 'given image too small to contain all pixels to be encoded';
+			86: msg := 'impossible offset in lz77 encoding (internal bug)';
+			87: msg := 'must provide custom zlib function pointer if LODEPNG_COMPILE_ZLIB is not defined';
+			88: msg := 'invalid filter strategy given for LodePNGEncoderSettings.filter_strategy';
+			89: msg := 'text chunk keyword too short or long: must have size 1-79';
+			// the windowsize in the LodePNGCompressSettings. Requiring POT(==> & instead of %) makes encoding 12% faster.
+			90: msg := 'windowsize must be a power of two';
+			91: msg := 'invalid decompressed idat size';
+			92: msg := 'too many pixels, not supported';
+			93: msg := 'zero width or height is invalid';
+			94: msg := 'header chunk must have a size of 13 bytes';
+		end;
+		result := 'код LodePNG {}'.Format([ToString(code)]);
+		if msg <> '' then result := '{} ({})'.Format([msg, result]);
+	end;
+
+var
+	lodepng: LodePNGLib;
+	data: array[0 .. 2047, 0 .. 2047, 0 .. 2] of uint8;
+	x, y: SizeInt;
+	r: pointer;
+	rsize: size_t;
+	loder: cuint;
+	f: &File;
+
 begin
 	con.ColoredLine('<B>В пору <1>белого</> хлада не ешь <RG>жёлтый</> снег.');
+	Assert(not f.Valid);
+	try
+		lodepng.Load('{}lib\{}\lodepng.dll'.Format([ExecRoot, CPU]));
+		Con.Line('Генерация...');
+		for y := 0 to High(data) do
+			for x := 0 to High(data[0]) do
+				data[x, y, 0] := round(High(data[0, 0, 0]) * clamp(sqr(1 - abs(1 - (x/High(data[0]) + y/High(data)))), 0, 1));
+
+		loder := lodepng.encode_memory(r, rsize, @data, length(data[0]), length(data), lodepng.CT_RGB, 8, lodepng.Presets[lodepng.Uber], lodepng.DefaultAllocator);
+		if loder <> 0 then raise Exception.Create('Не удалось сохранить картинку: {}.'.Format([lodepng.ErrorMessage(loder)]));
+		Con.Line('Сохранение...');
+		&File.Open(f, 'test.png', [f.Writeable]);
+		f.Write(0, r, rsize);
+		Con.ColoredLine('<G>Картинка сохранена</>, <R>а ты пидор :з</>.');
+	finally
+		f.Close;
+		FreeMem(r);
+		lodepng.Unload;
+	end;
 	readln;
 end.
-
