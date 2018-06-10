@@ -1,5 +1,7 @@
 {$mode objfpc} {$h+} {$typedaddress+} {$macro on} {$modeswitch duplicatelocals+} {$modeswitch typehelpers+} {$scopedenums+}
+{$modeswitch advancedrecords}
 {$ifdef assert} {$error} {$endif} {$ifopt Q+} {$define assert} {$endif}
+{$warn 2005 off} // comment level 2 found
 {$R *.res}
 program im;
 
@@ -39,6 +41,33 @@ uses
 // _end
 {$define unchecked := {$if defined(_end)} {$error unchecked would hide defines} {$endif}
 	{$push} {$rangechecks off} {$overflowchecks off} {$define _end := {$pop} {$undef _end}}}
+
+// шаблон для векторов
+{$define all_vectors :=
+	{$if defined(veclen) or defined(vec) or defined(pvec) or defined(pair3) or defined(foreach_component) or defined(reduce_vec) or
+		defined(iterate) or
+		defined(item_conv) or defined(op)}
+		{$error all_vectors would hide defines}
+	{$endif}
+
+	{$define foreach_component :=
+		{$if defined(item) or defined(itemid) or defined(first)} {$error foreach_component would hide defines} {$endif}
+		{$define item := x} {$define itemid := 0} {$define first} iterate {$undef first}
+		{$define item := y} {$define itemid := 1} iterate
+		{$if veclen >= 3} {$define item := z} {$define itemid := 2} iterate {$endif}
+		{$if veclen >= 4} {$define item := w} {$define itemid := 3} iterate {$endif}
+		{$undef item} {$undef itemid} {$undef iterate}}
+
+	{$define reduce_vec :=
+		{$define iterate :=
+			{$ifndef first} {$ifdef op} op {$else} + {$endif} {$endif}
+			{$ifdef item_conv} item_conv {$else} item {$endif}} foreach_component {$undef op} {$undef item_conv}}
+
+	{$define pair3 := Vec3}
+	{$define veclen := 2} {$define vec := Vec2} {$define pvec := pVec2} vecf
+	{$define veclen := 3} {$define vec := Vec3} {$define pvec := pVec3} vecf
+	{$define veclen := 4} {$define vec := Vec4} {$define pvec := pVec4} vecf
+	{$undef veclen} {$undef vec} {$undef pvec} {$undef pair3} {$undef vecf} {$undef foreach_component} {$undef reduce_vec}}
 
 const
 	EOL = LineEnding;
@@ -82,10 +111,18 @@ type
 
 	function min(const a, b: typename): typename; begin if a <= b then result := a else result := b; end;
 	function max(const a, b: typename): typename; begin if a >= b then result := a else result := b; end;
-	function RoundUp(x, m: typename): typename; begin result := x + (m - x mod m) mod m; end;
+	{$ifdef integer} function RoundUp(x, m: typename): typename; begin result := x + (m - x mod m) mod m; end; {$endif}
 	{$define keep_typename} {$define default_no := 0} ifthenimpl {$undef keep_typename}
-	{$undef typename}}
-	{$define typename := int32} impl {$define typename := uint32} impl  {$define typename := int64} impl {$define typename := uint64} impl
+
+	{$undef typename}
+	{$ifndef keep_integer} {$undef integer} {$endif}
+	{$ifndef keep_floating} {$undef floating} {$endif}}
+
+	{$define integer} {$define keep_integer}
+	{$define typename := int32} impl {$define typename := uint32} impl  {$define typename := int64} impl {$define typename := uint64} {$undef keep_integer} impl
+
+	{$define floating} {$define keep_floating}
+	{$define typename := single} impl {$define typename := double} {$undef keep_floating} impl
 {$undef impl}
 
 {$define typename := string} {$define default_no := ''} ifthenimpl
@@ -296,7 +333,7 @@ type
 		procedure Invalidate;
 		procedure Init;
 		procedure Done;
-		procedure Wait(var lock: ThreadLock);
+		procedure Wait(var lock: ThreadLock; timeout: uint = 0);
 		procedure WakeAll;
 		procedure WakeOne;
 	end;
@@ -383,6 +420,7 @@ type
 		                                // чтобы вывести сообщение о фатальной ошибке из произвольного потока и впоследствии
 		                                // усыплять (MaybeFreeze) остальные, которые попытаются тронуть консоль, включая считавшего себя её хозяином.
 		procedure BypassStickForCurrentThread;
+		function Width: uint;
 
 	type
 		CtrlC = class(Interception)
@@ -412,6 +450,7 @@ type
 		stick, bypassStick: TThreadID;
 		dying: pTask; // Die напоследок вызывает блокирующую ReadConsole. Заблокированный ctrl-обработчик перестаёт реагировать на события.
 		              // Поэтому Die выполняется вне обработчика.
+		function GetScreenBufferInfoE: CONSOLE_SCREEN_BUFFER_INFO;
 		class procedure RunCtrlCHandler(cookie: CtrlCCookie; param: pointer); static;
 		class procedure DieTask(param: pointer); static;
 		class function CtrlHandler(dwCtrlType: DWORD): Windows.BOOL; stdcall; static;
@@ -487,7 +526,7 @@ type
 		procedure Read(const at: FilePos; buf: pointer; size: SizeUint; onDone: CompletionHandler = nil; param: pointer = nil);
 		procedure Write(const at: FilePos; buf: pointer; size: SizeUint; onDone: CompletionHandler = nil; param: pointer = nil);
 		function Size: FileSize;
-		function CancelAllIORequests: boolean;
+		function CancelPendingIO: boolean;
 		class procedure Erase(const fn: string);
 
 	const
@@ -645,8 +684,31 @@ type
 	VarRec = object
 		class function VTypeToString(vt: SizeInt): string; static;
 		class function ToString(const v: TVarRec): string; static;
+	type
+		uint = uint64;
 	end;
 
+{$define vecf :=
+type
+	vec = record
+	type
+		LinearData = array[0 .. veclen - 1] of float;
+	var
+		data: LinearData;
+		class function Make(const value: float): vec; static;
+		class function Make(const {$define op := ,} reduce_vec: float): vec; static;
+	{$if veclen = 4}
+		class function Make(const v: Vec3; const w: float): vec; static;
+		class function Make31(const xyz, w: float): vec; static;
+	{$endif}
+		function ToString: string;
+		function Length: float;
+		function SquareLength: float;
+	{$if veclen = 4} function xyz: Vec3; {$endif}
+	{$define iterate := property item: float read data[itemid] write data[itemid];} foreach_component
+	end;} all_vectors
+
+type
 	Session = object
 	private class var
 		oldExceptProc: TExceptProc;
@@ -1030,11 +1092,14 @@ var
 	{$ifdef Debug} FreeMem(guard); {$endif}
 	end;
 
-	procedure ThreadCV.Wait(var lock: ThreadLock);
+	procedure ThreadCV.Wait(var lock: ThreadLock; timeout: uint = 0);
+	var
+		wt: dword;
 	begin
 		Assert(lock.AcquiredAssert);
 	{$ifdef Debug} lock.owner := 0; {$endif}
-		if not Win32.SleepConditionVariableSRW(cv, lock.srw, INFINITE, 0) then
+		if timeout = 0 then wt := INFINITE else wt := timeout;
+		if not Win32.SleepConditionVariableSRW(cv, lock.srw, wt, 0) and (GetLastError <> ERROR_TIMEOUT) then
 			raise Win32.OperationFailed('выполнить ожидание (SleepConditionVariableSRW)', GetLastError);
 	{$ifdef Debug} lock.owner := ThreadID; {$endif}
 	end;
@@ -1237,7 +1302,7 @@ var
 			if hOut = INVALID_HANDLE_VALUE then raise Win32.OperationFailed('открыть дескриптор консоли для вывода', GetLastError);
 			bookkeep += [HOutSet];
 
-			if not GetConsoleScreenBufferInfo(hOut, (@info)^) then raise Win32.OperationFailed('получить информацию от консоли (GetConsoleScreenBufferInfo)', GetLastError);
+			info := GetScreenBufferInfoE;
 			defCol := BitsToColor[info.wAttributes and %1111];
 			defBg := BitsToColor[info.wAttributes shr 4 and %1111];
 			defAttrWoCol := info.wAttributes and not word(%11111111); // FOREGROUND_* и BACKGROUND_*
@@ -1393,6 +1458,11 @@ var
 		lock.Leave;
 	end;
 
+	function Console.Width: uint;
+	begin
+		result := GetScreenBufferInfoE.dwSize.x;
+	end;
+
 	destructor Console.CtrlC.Destroy;
 	begin
 		Recover;
@@ -1427,6 +1497,11 @@ var
 		MaybeFreeze(false);
 		bookkeep -= [CtrlCPending];
 		lock.Leave;
+	end;
+
+	function Console.GetScreenBufferInfoE: CONSOLE_SCREEN_BUFFER_INFO;
+	begin
+		if not GetConsoleScreenBufferInfo(hOut, (@result)^) then raise Win32.OperationFailed('получить информацию от консоли (GetConsoleScreenBufferInfo)', GetLastError);
 	end;
 
 	class procedure Console.RunCtrlCHandler(cookie: CtrlCCookie; param: pointer);
@@ -1752,7 +1827,7 @@ var
 		if GetFileSizeEx(ref^.h, @sz) then result := sz.QuadPart else raise Win32.OperationFailed('получить размер файла (GetFileSizeEx)', GetLastError);
 	end;
 
-	function &File.CancelAllIORequests: boolean;
+	function &File.CancelPendingIO: boolean;
 	begin
 		if CancelIoEx(ref^.h, nil) or (GetLastError = Win32.ERROR_NOT_FOUND) then
 			result := GetLastError <> Win32.ERROR_NOT_FOUND
@@ -2378,6 +2453,38 @@ var
 		end;
 	end;
 
+{$define vecf :=
+	class function vec.Make(const value: float): vec; begin {$define iterate := result.item := value;} foreach_component end;
+	class function vec.Make(const {$define op := ,} reduce_vec: float): vec; begin {$define iterate := result.data[itemid] := item;} foreach_component end;
+{$if veclen = 4}
+	class function vec.Make(const v: Vec3; const w: float): vec; begin {$define iterate := {$if itemid <= 2} result.data[itemid] := v.data[itemid]; {$else} result.w := w; {$endif}} foreach_component end;
+	class function vec.Make31(const xyz, w: float): vec; begin {$define iterate := result.data[itemid] := {$if itemid <= 2} xyz {$else} w {$endif};} foreach_component end;
+{$endif}
+
+	function vec.ToString: string;
+		function ComponentToString(const x: float): string; begin str(x:0:2, result); end;
+	begin
+		result := {$define item_conv := {$ifndef first} ', ' + {$endif} ComponentToString(data[itemid])} reduce_vec;
+	end;
+
+	function vec.Length: float;
+	begin
+		result := sqrt(SquareLength);
+	end;
+
+	function vec.SquareLength: float;
+	begin
+		result := {$define item_conv := sqr(data[itemid])} reduce_vec;
+	end;
+
+{$if veclen = 4}
+	function vec.xyz: pair3; begin result.data[0] := data[0]; result.data[1] := data[1]; result.data[2] := data[2]; end;
+{$endif}
+
+	operator +(const a, b: vec): vec; begin {$define iterate := result.data[itemid] := a.data[itemid] + b.data[itemid];} foreach_component end;
+	operator *(const x: float; const v: vec): vec; begin {$define iterate := result.data[itemid] := v.data[itemid] * x;} foreach_component end;
+	operator *(const v: vec; const x: float): vec; begin result := x * v; end;} all_vectors
+
 	class constructor Session.Init;
 	var
 		si: SYSTEM_INFO;
@@ -2942,8 +3049,8 @@ type
 	ImageFormat = (G, GA, RGB, RGBA);
 
 	ImageFormatHelper = type helper for ImageFormat
-		function PixelSize: size_t;
-		function ToString: string;
+		function pixelSize: size_t;
+		function id: string;
 	const
 		Info: array[ImageFormat] of record
 			id: string;
@@ -2957,6 +3064,12 @@ type
 		);
 	end;
 
+	p1x8 = ^_1x8; _1x8 = array[0 .. 0] of uint8;
+	p2x8 = ^_2x8; _2x8 = array[0 .. 1] of uint8;
+	p3x8 = ^_3x8; _3x8 = array[0 .. 2] of uint8;
+	p4x8 = ^_4x8; _4x8 = array[0 .. 3] of uint8;
+
+	pImage = ^Image;
 	Image = object
 		data: pointer;
 		w, h, frames: uint;
@@ -2968,22 +3081,41 @@ type
 		class procedure ValidateSize(w, h, frames: uint; format: ImageFormat; const name: string); static;
 		class procedure ValidateFrame(index, count: uint; const name: string); static;
 		class function AllocateData(w, h, frames: uint; format: ImageFormat; const name: string): pointer; static;
+		function PixelPtr(x, y, f: SizeUint): pointer;
 		procedure DecodePixelNumber(pixel: SizeUint; out x, y, f: SizeUint; out ofs: pointer);
+		procedure NextPixel(var pixel: SizeUint; var x, y, f: SizeUint);
+
+		class function ApplyGamma(const linear: float): float; static;
+		class function UnapplyGamma(const rgbcomponent: float): float; static;
+		class function ReadG(ofs: pointer; format: ImageFormat): float; static;
+		class function ReadGA(ofs: pointer; format: ImageFormat): Vec2; static;
+		class function ReadRGB(ofs: pointer; format: ImageFormat): Vec3; static;
+		class function ReadRGBA(ofs: pointer; format: ImageFormat): Vec4; static;
+		class function ReadLinearRGBA(ofs: pointer; format: ImageFormat): Vec4; static;
+		class procedure WriteG(ofs: pointer; format: ImageFormat; const px: float); static;
+		class procedure WriteGA(ofs: pointer; format: ImageFormat; const px: Vec2); static;
+		class procedure WriteRGB(ofs: pointer; format: ImageFormat; const px: Vec3); static;
+		class procedure WriteRGBA(ofs: pointer; format: ImageFormat; const px: Vec4); static;
+		class procedure WriteLinearRGBA(ofs: pointer; format: ImageFormat; const px: Vec4); static;
+		class function RGB8ToLinearGray(ofs: pointer): float; static;
+		class function LinearRGBToGray(const r, g, b: float): float; static;
+		class function Denorm8(const value: float): uint8; static;
+
+		class function SizeToString(w, h, f: SizeUint): string; static;
+		class function SizeToString(w, h, f: SizeUint; format: ImageFormat): string; static;
 
 	const
 		MaxDataSize = {$if defined(CPU32)} High(SizeUint) {$elseif defined(CPU64)} High(SizeUint) shr 16 {$else} {$error platform?} {$endif} div 8;
 		MaxDimension = 65536;
-		MaxFrames = 65536;
-
-	type
-		p1x8 = ^_1x8; _1x8 = array[0 .. 0] of uint8;
-		p2x8 = ^_2x8; _2x8 = array[0 .. 1] of uint8;
-		p3x8 = ^_3x8; _3x8 = array[0 .. 2] of uint8;
-		p4x8 = ^_4x8; _4x8 = array[0 .. 3] of uint8;
+		MaxFrames = 1000;
+		Norm8 = 1 / High(uint8);
+		RToGrayK = 0.21;
+		GToGrayK = 0.72;
+		BToGrayK = 0.07;
 	end;
 
-	function ImageFormatHelper.PixelSize: size_t; begin result := Info[self].pixelSize; end;
-	function ImageFormatHelper.ToString: string; begin result := Info[self].id; end;
+	function ImageFormatHelper.pixelSize: size_t; begin result := Info[self].pixelSize; end;
+	function ImageFormatHelper.id: string; begin result := Info[self].id; end;
 
 	procedure Image.Invalidate;
 	begin
@@ -3026,12 +3158,12 @@ type
 
 	class procedure Image.ValidateSize(w, h, frames: uint; format: ImageFormat; const name: string);
 	begin
-		if (w = 0) or (h = 0) or (frames = 0) then raise Exception.Create('Неверный размер {}.'.Format([name]));
+		if (w = 0) or (h = 0) or (frames = 0) then raise Exception.Create('Неверный размер {}: {}.'.Format([name, SizeToString(w, h, frames)]));
 		if (w > MaxDimension) or (h > MaxDimension) or (frames > MaxFrames) or
-			(w > MaxDataSize div format.pixelSize) or (h > MaxDataSize div format.pixelSize div w) or
-			(frames > MaxDataSize div format.pixelSize div w div h)
+			(w > MaxDataSize div ImageFormatHelper.Info[format].pixelSize) or (h > MaxDataSize div ImageFormatHelper.Info[format].pixelSize div w) or
+			(frames > MaxDataSize div ImageFormatHelper.Info[format].pixelSize div w div h)
 		then
-			raise Exception.Create('{}: слишком большая картинка.'.Format([name]));
+			raise Exception.Create('{}: слишком большая картинка ({}).'.Format([name, SizeToString(w, h, frames, format)]));
 	end;
 
 	class procedure Image.ValidateFrame(index, count: uint; const name: string);
@@ -3043,7 +3175,17 @@ type
 	class function Image.AllocateData(w, h, frames: uint; format: ImageFormat; const name: string): pointer;
 	begin
 		ValidateSize(w, h, frames, format, name);
-		result := GetMem(format.PixelSize * w * h * frames);
+		result := GetMem(ImageFormatHelper.Info[format].pixelSize * w * h * frames);
+	end;
+
+	function Image.PixelPtr(x, y, f: SizeUint): pointer;
+	var
+		ofs: SizeUint;
+	begin
+		Assert((x < w) and (y < h) and (f < frames), 'x = {}/{}, y = {}/{}, frames = {}/{}'.Format([x, w, y, h, f, frames]));
+		ofs := y * w + x;
+		if f > 0 then ofs += w * h * f;
+		result := data + ofs * format.pixelSize;
 	end;
 
 	procedure Image.DecodePixelNumber(pixel: SizeUint; out x, y, f: SizeUint; out ofs: pointer);
@@ -3051,7 +3193,155 @@ type
 		f := pixel div (w * h);
 		y := pixel mod (w * h) div w;
 		x := pixel mod w;
-		ofs := data + pixel * format.PixelSize;
+		ofs := data + pixel * format.pixelSize;
+	end;
+
+	procedure Image.NextPixel(var pixel: SizeUint; var x, y, f: SizeUint);
+	begin
+		inc(pixel);
+		inc(x);
+		if x = w then
+		begin
+			x := 0; inc(y);
+			if y = h then
+			begin
+				y := 0; inc(f);
+			end;
+		end;
+	end;
+
+	class function Image.ApplyGamma(const linear: float): float; begin result := sqrt(linear); end;
+	class function Image.UnapplyGamma(const rgbcomponent: float): float; begin result := sqr(rgbcomponent); end;
+
+	class function Image.ReadG(ofs: pointer; format: ImageFormat): float;
+	begin
+		case format of
+			ImageFormat.G, ImageFormat.GA: result := p1x8(ofs)^[0] * Norm8;
+			ImageFormat.RGB, ImageFormat.RGBA: result := RGB8ToLinearGray(ofs);
+			else {$ifdef Debug} raise Exception.Create('ReadG: {}'.Format([ord(format)])) {$else} result := 0 {$endif};
+		end;
+	end;
+
+	class function Image.ReadGA(ofs: pointer; format: ImageFormat): Vec2;
+	begin
+		case format of
+			ImageFormat.G: result := Vec2.Make(p1x8(ofs)^[0] * Norm8, 1.0);
+			ImageFormat.GA: result := Vec2.Make(p2x8(ofs)^[0] * Norm8, p2x8(ofs)^[1] * Norm8);
+			ImageFormat.RGB: result := Vec2.Make(RGB8ToLinearGray(ofs), 1.0);
+			ImageFormat.RGBA: result := Vec2.Make(RGB8ToLinearGray(ofs), p4x8(ofs)^[3] * Norm8);
+			else {$ifdef Debug} raise Exception.Create('ReadGA: {}'.Format([ord(format)])) {$else} result := Vec2.Make(0, 1) {$endif};
+		end;
+	end;
+
+	class function Image.ReadRGB(ofs: pointer; format: ImageFormat): Vec3;
+	begin
+		case format of
+			ImageFormat.G, ImageFormat.GA: result := Vec3.Make(p1x8(ofs)^[0] * Norm8);
+			ImageFormat.RGB, ImageFormat.RGBA: result := Vec3.Make(p3x8(ofs)^[0] * Norm8, p3x8(ofs)^[1] * Norm8, p3x8(ofs)^[2] * Norm8);
+			else {$ifdef Debug} raise Exception.Create('ReadRGB: {}'.Format([ord(format)])) {$else} result := Vec3.Make(0) {$endif};
+		end;
+	end;
+
+	class function Image.ReadRGBA(ofs: pointer; format: ImageFormat): Vec4;
+	begin
+		case format of
+			ImageFormat.G: result := Vec4.Make31(p1x8(ofs)^[0] * Norm8, 1.0);
+			ImageFormat.GA: result := Vec4.Make31(p2x8(ofs)^[0] * Norm8, p2x8(ofs)^[1] * Norm8);
+			ImageFormat.RGB: result := Vec4.Make(p3x8(ofs)^[0] * Norm8, p3x8(ofs)^[1] * Norm8, p3x8(ofs)^[2] * Norm8, 1.0);
+			ImageFormat.RGBA: result := Vec4.Make(p4x8(ofs)^[0] * Norm8, p4x8(ofs)^[1] * Norm8, p4x8(ofs)^[2] * Norm8, p4x8(ofs)^[3] * Norm8);
+			else {$ifdef Debug} raise Exception.Create('ReadRGBA: {}'.Format([ord(format)])) {$else} result := Vec4.Make(0, 0, 0, 1) {$endif};
+		end;
+	end;
+
+	class function Image.ReadLinearRGBA(ofs: pointer; format: ImageFormat): Vec4;
+	begin
+		case format of
+			ImageFormat.G: result := Vec4.Make31(UnapplyGamma(p1x8(ofs)^[0] * Norm8), 1.0);
+			ImageFormat.GA: result := Vec4.Make31(UnapplyGamma(p2x8(ofs)^[0] * Norm8), p2x8(ofs)^[1] * Norm8);
+			ImageFormat.RGB: result := Vec4.Make(UnapplyGamma(p3x8(ofs)^[0] * Norm8), UnapplyGamma(p3x8(ofs)^[1] * Norm8), UnapplyGamma(p3x8(ofs)^[2] * Norm8), 1.0);
+			ImageFormat.RGBA: result := Vec4.Make(UnapplyGamma(p4x8(ofs)^[0] * Norm8), UnapplyGamma(p4x8(ofs)^[1] * Norm8), UnapplyGamma(p4x8(ofs)^[2] * Norm8), p4x8(ofs)^[3] * Norm8);
+			else {$ifdef Debug} raise Exception.Create('ReadLinearRGBA: {}'.Format([ord(format)])) {$else} result := Vec4.Make(0, 0, 0, 1) {$endif};
+		end;
+	end;
+
+	class procedure Image.WriteG(ofs: pointer; format: ImageFormat; const px: float);
+	begin
+		case format of
+			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(px);
+			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(px); p2x8(ofs)^[1] := High(uint8); end;
+			ImageFormat.RGB: begin p3x8(ofs)^[0] := Denorm8(px); p3x8(ofs)^[1] := p3x8(ofs)^[0]; p3x8(ofs)^[2] := p3x8(ofs)^[0]; end;
+			ImageFormat.RGBA: begin p4x8(ofs)^[0] := Denorm8(px); p4x8(ofs)^[1] := p4x8(ofs)^[0]; p4x8(ofs)^[2] := p4x8(ofs)^[0]; p4x8(ofs)^[3] := High(uint8); end;
+			else {$ifdef Debug} raise Exception.Create('WriteLinearG: {}'.Format([ord(format)])) {$endif};
+		end;
+	end;
+
+	class procedure Image.WriteGA(ofs: pointer; format: ImageFormat; const px: Vec2);
+	begin
+		case format of
+			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(px.data[0]);
+			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(px.data[0]); p2x8(ofs)^[1] := Denorm8(px.data[1]); end;
+			ImageFormat.RGB: begin p3x8(ofs)^[0] := Denorm8(px.data[0]); p3x8(ofs)^[1] := p3x8(ofs)^[0]; p3x8(ofs)^[2] := p3x8(ofs)^[0]; end;
+			ImageFormat.RGBA: begin p4x8(ofs)^[0] := Denorm8(px.data[0]); p4x8(ofs)^[1] := p4x8(ofs)^[0]; p4x8(ofs)^[2] := p4x8(ofs)^[0]; p4x8(ofs)^[3] := Denorm8(px.data[1]); end;
+			else {$ifdef Debug} raise Exception.Create('WriteLinearGA: {}'.Format([ord(format)])) {$endif};
+		end;
+	end;
+
+	class procedure Image.WriteRGB(ofs: pointer; format: ImageFormat; const px: Vec3);
+	begin
+		case format of
+			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(LinearRGBToGray(px.data[0], px.data[1], px.data[2]));
+			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(LinearRGBToGray(px.data[0], px.data[1], px.data[2])); p2x8(ofs)^[1] := High(uint8); end;
+			ImageFormat.RGB: begin p3x8(ofs)^[0] := Denorm8(px.data[0]); p3x8(ofs)^[1] := Denorm8(px.data[1]); p3x8(ofs)^[2] := Denorm8(px.data[2]); end;
+			ImageFormat.RGBA: begin p3x8(ofs)^[0] := Denorm8(px.data[0]); p3x8(ofs)^[1] := Denorm8(px.data[1]); p3x8(ofs)^[2] := Denorm8(px.data[2]); p4x8(ofs)^[3] := High(uint8); end;
+			else {$ifdef Debug} raise Exception.Create('WriteLinearRGB: {}'.Format([ord(format)])) {$endif};
+		end;
+	end;
+
+	class procedure Image.WriteRGBA(ofs: pointer; format: ImageFormat; const px: Vec4);
+	begin
+		case format of
+			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(LinearRGBToGray(px.data[0], px.data[1], px.data[2]));
+			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(LinearRGBToGray(px.data[0], px.data[1], px.data[2])); p2x8(ofs)^[1] := Denorm8(px.data[3]); end;
+			ImageFormat.RGB: begin p3x8(ofs)^[0] := Denorm8(px.data[0]); p3x8(ofs)^[1] := Denorm8(px.data[1]); p3x8(ofs)^[2] := Denorm8(px.data[2]); end;
+			ImageFormat.RGBA: begin p4x8(ofs)^[0] := Denorm8(px.data[0]); p4x8(ofs)^[1] := Denorm8(px.data[1]); p4x8(ofs)^[2] := Denorm8(px.data[2]); p4x8(ofs)^[3] := Denorm8(px.data[3]); end;
+			else {$ifdef Debug} raise Exception.Create('WriteLinearRGBA: {}'.Format([ord(format)])) {$endif};
+		end;
+	end;
+
+	class procedure Image.WriteLinearRGBA(ofs: pointer; format: ImageFormat; const px: Vec4);
+	begin
+		case format of
+			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(ApplyGamma(LinearRGBToGray(px.data[0], px.data[1], px.data[2])));
+			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(ApplyGamma(LinearRGBToGray(px.data[0], px.data[1], px.data[2]))); p2x8(ofs)^[1] := Denorm8(px.data[3]); end;
+			ImageFormat.RGB: begin p3x8(ofs)^[0] := Denorm8(ApplyGamma(px.data[0])); p3x8(ofs)^[1] := Denorm8(ApplyGamma(px.data[1])); p3x8(ofs)^[2] := Denorm8(ApplyGamma(px.data[2])); end;
+			ImageFormat.RGBA: begin p4x8(ofs)^[0] := Denorm8(ApplyGamma(px.data[0])); p4x8(ofs)^[1] := Denorm8(ApplyGamma(px.data[1])); p4x8(ofs)^[2] := Denorm8(ApplyGamma(px.data[2])); p4x8(ofs)^[3] := Denorm8(px.data[3]); end;
+			else {$ifdef Debug} raise Exception.Create('WriteLinearRGBA: {}'.Format([ord(format)])) {$endif};
+		end;
+	end;
+
+	class function Image.RGB8ToLinearGray(ofs: pointer): float;
+	begin
+		result := (RToGrayK * UnapplyGamma(p3x8(ofs)^[0] * Norm8) + GToGrayK * UnapplyGamma(p3x8(ofs)^[1] * Norm8) + BToGrayK * UnapplyGamma(p3x8(ofs)^[2] * Norm8));
+	end;
+
+	class function Image.LinearRGBToGray(const r, g, b: float): float;
+	begin
+		result := RToGrayK * r + GToGrayK * g + BToGrayK * b;
+	end;
+
+	class function Image.Denorm8(const value: float): uint8;
+	begin
+		result := round(clamp(value * High(result), 0, High(result)));
+	end;
+
+	class function Image.SizeToString(w, h, f: SizeUint): string;
+	begin
+		result := ('{}x{}' + IfThen(f <> 1, 'x{}')).Format([VarRec.uint(w), VarRec.uint(h), VarRec.uint(f)]);
+	end;
+
+	class function Image.SizeToString(w, h, f: SizeUint; format: ImageFormat): string;
+	begin
+		result := ('{}' + IfThen(format <> ImageFormat.RGB, '{}')).Format([SizeToString(w, h, f), format.id]);
 	end;
 
 type
@@ -3059,7 +3349,7 @@ type
 	{$define enum := ModeEnum} {$define items := Filename _ 0 _ Alias _ 1} enum_with_shortcuts
 	var
 		mode: ModeEnum;
-		name: string;
+		name, orig: string;
 		frame, insertFrameNoAt: SizeInt;
 		class function Parse(const data: string): ImageName; static;
 	end;
@@ -3074,7 +3364,8 @@ type
 		result.frame := -1;
 		result.insertFrameNoAt := 0;
 		i := 1;
-		result.name := data;
+		nn := data;
+		result.orig := data;
 		while i <= length(nn) do
 			case nn[i] of
 				'\', '/': begin canBeAlias := false; inc(i); end;
@@ -3099,7 +3390,6 @@ type
 				else inc(i);
 			end;
 
-		result.name := nn;
 		if canBeAlias then result.mode := Alias else result.mode := Filename;
 	end;
 
@@ -3179,7 +3469,7 @@ type
 	begin
 		lck.Enter;
 		try
-			if nItems + 1 >= length(items) then SetLength(items, Ary.GrowStgy(nItems + 1, length(items)));
+			if nItems >= length(items) then SetLength(items, Ary.GrowStgy(nItems + 1, length(items)));
 			inc(nItems);
 			items[nItems - 1].item := item^.Ref;
 			items[nItems - 1].name := name;
@@ -3245,7 +3535,6 @@ type
 		destructor Destroy; override;
 		procedure Start; virtual;
 		procedure GeneratePart(threadIndex, startPixel, endPixel: SizeUint); virtual;
-		procedure OnInterception; virtual;
 	end;
 
 	GenericOp = class(TObjectEx)
@@ -3253,7 +3542,7 @@ type
 		InputStage = (Ready, Opening, Reading, QueuedForDecoding, Decoding, Completed);
 		OutputStage = (Ready, Opening, QueuedForEncoding, Encoding, Writing, Completed);
 		GlobalStage = (Ready, Reading, Processing, Saving, Done);
-		Status = (OK, Cancelled, Failed);
+		Status = (Running, Cancelled, Failed, Completed);
 
 		pTaskParam = ^TaskParam;
 		TaskParam = record
@@ -3321,12 +3610,14 @@ type
 		procedure Wait;
 		function Progress: float;
 		procedure NoteProgress(threadIndex: SizeUint; const progress: float); // Должна вызываться из GenericOpPayload.GeneratePart.
+		class function InfiniteProgressBar(const time, halfEst: seconds): float; static;
 	private
 		abortPosted: boolean;
 		function CodingThreads: SizeUint;
 		procedure Abort;
 		procedure StartSubtask(lock: boolean);
 		procedure EndSubtask(lock: boolean);
+		procedure CleanupInputs;
 		class procedure OnCtrlC(param: pointer); static;
 		class procedure OnInterceptLodeRealloc(param: pointer); static;
 		class procedure OnOpenAndStartReadingInputFile(param: pointer); static;
@@ -3362,7 +3653,6 @@ type
 
 	procedure GenericOpPayload.Start; begin end;
 	procedure GenericOpPayload.GeneratePart(threadIndex, startPixel, endPixel: SizeUint); begin {$define args := threadIndex _ startPixel _ endPixel} unused_args end;
-	procedure GenericOpPayload.OnInterception; begin end;
 
 	constructor GenericOp.Create(var ir: ImageRegistry; pl: pGenericOpPayload);
 	begin
@@ -3383,28 +3673,18 @@ type
 	var
 		i: SizeInt;
 	begin
-		lock.Enter;
-		try
-			ctrlC.Free(ctrlC);
-			lodeHook.Free(lodeHook);
-			Cancel(false);
-		finally
-			lock.Leave;
-		end;
+		Cancel(true);
 		Wait;
 
-		for i := 0 to High(inputs) do
-		begin
-			inputs[i].task^.Close(inputs[i].task);
-			inputs[i].im^.Release(inputs[i].im);
-			inputs[i].f.Close;
-			FreeMem(inputs[i].data);
-			if Assigned(inputs[i].param) then dispose(inputs[i].param);
-		end;
+		ctrlC.Free(ctrlC);
+		lodeHook.Free(lodeHook);
+
+		CleanupInputs;
+		for i := 0 to High(inputs) do inputs[i].task^.Close(inputs[i].task);
 		for i := 0 to High(threads) do
 		begin
 			threads[i].task^.Close(threads[i].task);
-			if Assigned(threads[i].param) then dispose(threads[i].param);
+			if Assigned(threads[i].param) then begin dispose(threads[i].param); threads[i].param := nil; end;
 		end;
 		for i := 0 to High(fileOutputs) do
 		begin
@@ -3464,8 +3744,8 @@ type
 								new(inputs[i].param);
 								inputs[i].param^.op := self;
 								inputs[i].param^.index := i;
-								StartSubtask(false); inc(pendingInputs);
 								inputs[i].stage := InputStage.Opening;
+								StartSubtask(false); inc(pendingInputs);
 								try
 									Assert(not Assigned(inputs[i].task));
 									Task.Post(inputs[i].task, Task.Body(@GenericOp.OnOpenAndStartReadingInputFile), inputs[i].param);
@@ -3489,9 +3769,11 @@ type
 	begin
 		if lock then self.lock.Enter else Assert(self.lock.AcquiredAssert);
 		try
-			if stage = GlobalStage.Done then exit;
-			if stat = Status.OK then stat := Status.Cancelled;
-			Abort;
+			if stat = Status.Running then
+			begin
+				stat := Status.Cancelled;
+				Abort;
+			end;
 		finally
 			if lock then self.lock.Leave;
 		end;
@@ -3501,7 +3783,9 @@ type
 	begin
 		lock.Enter;
 		try
-			if (Exception.Current is Interception) and (stat in [Status.OK, Status.Cancelled]) then stat := Status.Cancelled else
+			if (Exception.Current is Interception) and (stat in [Status.Running, Status.Cancelled, Status.Completed]) then
+				if stat <> Status.Completed then stat := Status.Cancelled else
+			else
 				if stat <> Status.Failed then
 				begin
 					stat := Status.Failed;
@@ -3517,7 +3801,7 @@ type
 	begin
 		lock.Enter;
 		try
-			if stat <> Status.OK then raise Interception.Create('Операция прервана.');
+			if stat <> Status.Running then raise Interception.Create('Операция прервана.');
 		finally
 			lock.Leave;
 		end;
@@ -3534,10 +3818,6 @@ type
 	end;
 
 	function GenericOp.Progress: float;
-	const
-		OnceRead = 0.1;
-		OnceProcessed = 0.9;
-
 		function SingleReadingProgress(const inp: InputRec): float;
 		const
 			WhenReading = 0.05;
@@ -3546,7 +3826,7 @@ type
 			case inp.stage of
 				InputStage.Reading: result := WhenReading;
 				InputStage.QueuedForDecoding: result := OnceRead;
-				InputStage.Decoding: result := OnceRead + (1 - OnceRead) * clamp(1 - pow(0.5, seconds(Ticks.Get - inp.startedAt) / inp.decodingHalfTimeEstimation), 0, 1);
+				InputStage.Decoding: result := OnceRead + (1 - OnceRead) * InfiniteProgressBar(Ticks.Get - inp.startedAt, inp.decodingHalfTimeEstimation);
 				InputStage.Completed: result := 1;
 				else result := 0;
 			end;
@@ -3556,44 +3836,72 @@ type
 		var
 			i: SizeInt;
 		begin
-			if Ary(fileInputs).Empty then result := 0 else
-			begin
-				result := 0;
-				for i := 0 to High(fileInputs) do result += SingleReadingProgress(inputs[fileInputs[i]]);
-				result := result / length(fileInputs) * OnceRead;
-			end;
+			result := 0; if Ary(fileInputs).Empty then exit;
+			for i := 0 to High(fileInputs) do result += SingleReadingProgress(inputs[fileInputs[i]]);
+			result := result / length(fileInputs);
 		end;
 
 		function ProcessingProgress: float;
 		var
-			sum: float;
 			i: SizeInt;
 		begin
-			if Ary(threads).Empty then exit(0);
-			sum := 0;
-			for i := 0 to High(threads) do sum += threads[i].progress;
-			result := sum / length(threads);
+			result := 0; if Ary(threads).Empty then exit;
+			for i := 0 to High(threads) do result += threads[i].progress;
+			result /= length(threads);
 		end;
-	begin
-		lock.Enter;
-		try
-			case stage of
-				GlobalStage.Reading: result := ReadingProgress;
-				GlobalStage.Processing: result := OnceRead + (OnceProcessed - OnceRead) * ProcessingProgress;
-				GlobalStage.Saving: result := OnceProcessed;
-				GlobalStage.Done: result := 1.0;
-				else result := 0.0;
+
+		function OnceProcessed: float;
+		begin
+			if oname.mode = oname.Alias then result := 1 else result := 0.6;
+		end;
+
+		function SingleSavingProgress(const outp: OutputRec): float;
+		const
+			WhenQueued = 0.05;
+			WhenWriting = 0.95;
+		begin
+			case outp.stage of
+				OutputStage.QueuedForEncoding: result := WhenQueued;
+				OutputStage.Encoding: result := WhenQueued + (WhenWriting - WhenQueued) * InfiniteProgressBar(Ticks.Get - outp.startedAt, 2.0);
+				OutputStage.Writing: result := WhenWriting + (1.0 - WhenWriting) * InfiniteProgressBar(Ticks.Get - outp.startedAt, 1.0);
+				OutputStage.Completed: result := 1.0;
+				else result := 0;
 			end;
-		finally
-			lock.Leave;
+		end;
+
+		function SavingProgress: float;
+		var
+			i: SizeInt;
+		begin
+			result := 0; if Ary(fileOutputs).Empty then exit;
+			for i := 0 to High(fileOutputs) do result += SingleSavingProgress(fileOutputs[i]);
+			result /= length(fileOutputs);
+		end;
+
+	const
+		OnceRead = 0.1;
+	begin
+		Assert(lock.AcquiredAssert);
+		case stage of
+			GlobalStage.Reading: result := OnceRead * ReadingProgress;
+			GlobalStage.Processing: result := OnceRead + (OnceProcessed - OnceRead) * ProcessingProgress;
+			GlobalStage.Saving: result := OnceProcessed + (0.99 - OnceProcessed) * SavingProgress;
+			GlobalStage.Done: result := 1.0;
+			else result := 0.0;
 		end;
 	end;
 
 	procedure GenericOp.NoteProgress(threadIndex: SizeUint; const progress: float);
 	begin
+		Intercept;
 		lock.Enter;
 		threads[threadIndex].progress := progress;
 		lock.Leave;
+	end;
+
+	class function GenericOp.InfiniteProgressBar(const time, halfEst: seconds): float;
+	begin
+		result := clamp(1.0 - pow(0.5, time / halfEst), 0.0, 1.0);
 	end;
 
 	function GenericOp.CodingThreads: SizeUint;
@@ -3602,10 +3910,21 @@ type
 	end;
 
 	procedure GenericOp.Abort;
+	var
+		i: SizeInt;
 	begin
 		Assert(lock.AcquiredAssert);
+		hey.WakeAll;
 		if abortPosted then exit;
 		abortPosted := true;
+		case stage of
+			GlobalStage.Reading:
+				for i := 0 to High(inputs) do
+					if (inputs[i].stage = InputStage.Reading) and inputs[i].f.Valid then inputs[i].f.CancelPendingIO;
+			GlobalStage.Saving:
+				for i := 0 to High(fileOutputs) do
+					if (fileOutputs[i].stage = OutputStage.Writing) and fileOutputs[i].f.Valid then fileOutputs[i].f.CancelPendingIO;
+		end;
 	end;
 
 	procedure GenericOp.StartSubtask(lock: boolean);
@@ -3622,6 +3941,20 @@ type
 			dec(running); if running = 0 then hey.WakeAll;
 		finally
 			if lock then self.lock.Leave;
+		end;
+	end;
+
+	procedure GenericOp.CleanupInputs;
+	var
+		i: SizeInt;
+	begin
+		for i := 0 to High(inputs) do
+		begin
+			// task изредкадедлокается, мне лень разбираться, поэтому очищается в деструкторе отдельно
+			inputs[i].im^.Release(inputs[i].im);
+			inputs[i].f.Close;
+			FreeMem(inputs[i].data);
+			if Assigned(inputs[i].param) then begin dispose(inputs[i].param); inputs[i].param := nil; end;
 		end;
 	end;
 
@@ -3649,13 +3982,18 @@ type
 				if inp.f.Size > Image.MaxDataSize then raise Exception.Create('{}: слишком большой файл.'.Format([inp.f.Size]));
 				inp.dataSize := inp.f.Size;
 				inp.data := GetMem(inp.dataSize);
-				inp.stage := InputStage.Reading;
-				inp.startedAt := Ticks.Get;
-				StartSubtask(true);
+				lock.Enter;
 				try
-					inp.f.Read(0, inp.data, inp.dataSize, &File.CompletionHandler(@GenericOp.OnEndReadingInputFile), inp.param);
-				except
-					EndSubtask(false); raise;
+					inp.stage := InputStage.Reading;
+					inp.startedAt := Ticks.Get;
+					StartSubtask(false);
+					try
+						inp.f.Read(0, inp.data, inp.dataSize, &File.CompletionHandler(@GenericOp.OnEndReadingInputFile), inp.param);
+					except
+						EndSubtask(false); raise;
+					end;
+				finally
+					lock.Leave;
 				end;
 			except
 				FailFromExcept;
@@ -3693,7 +4031,7 @@ type
 						MaybeProceedToPayload(false);
 					end else
 					begin
-						inp.decodingHalfTimeEstimation := clamp(10 * seconds(Ticks.Get - inp.startedAt), 0.1, 10.0);
+						inp.decodingHalfTimeEstimation := clamp(100 * seconds(Ticks.Get - inp.startedAt), 0.1, 10.0);
 						inp.stage := InputStage.QueuedForDecoding;
 						SizeInt(Ary(undecoded).Grow(TypeInfo(undecoded))^) := @inp - pInputRec(inputs);
 						MaybeStartDecoding;
@@ -3743,6 +4081,7 @@ type
 					'png': DecodePNG(inp);
 					else raise Exception.Create('{}: неизвестный формат.'.Format([inp.name.name]));
 				end;
+				FreeMem(inp.data);
 
 				lock.Enter;
 				try
@@ -3865,6 +4204,7 @@ type
 			if (stage = GlobalStage.Reading) and (pendingInputs = 0) then
 			begin
 				stage := GlobalStage.Processing;
+				hey.WakeAll;
 				StartProcessing;
 			end;
 		finally
@@ -3880,7 +4220,7 @@ type
 		i: SizeInt;
 	begin
 		Assert(lock.AcquiredAssert);
-		if Assigned(pl) then pl.Start;
+		pl.Start;
 		if Assigned(pl.im.data) then
 		begin
 			pixels := SizeUint(pl.im.w) * pl.im.h * pl.im.frames;
@@ -3937,7 +4277,10 @@ type
 		if processing = 0 then
 		begin
 			stage := GlobalStage.Saving;
+			hey.WakeAll;
+			CleanupInputs;
 			StartSavingOutputs;
+			MaybeComplete;
 		end;
 	end;
 
@@ -4038,7 +4381,6 @@ type
 		try
 			try
 				Intercept;
-				writeln('opening #', outp.param^.index,': ', outp.fn);
 				outp.f.Open(outp.fn, [outp.f.Writeable]);
 				lock.Enter;
 				try
@@ -4066,7 +4408,6 @@ type
 			index := unencoded[High(unencoded)]; SetLength(unencoded, length(unencoded) - 1);
 			StartSubtask(false); inc(encoding);
 			try
-				writeln('encoding #', index);
 				fileOutputs[index].stage := OutputStage.Encoding;
 				fileOutputs[index].startedAt := Ticks.Get;
 				Task.Post(fileOutputs[index].encodeTask, Task.Body(@GenericOp.OnEncodeAndStartWritingOutputFile), fileOutputs[index].param);
@@ -4094,11 +4435,11 @@ type
 				lock.Enter;
 				try
 					outp.stage := OutputStage.Writing;
+					outp.startedAt := Ticks.Get;
 					dec(encoding);
 					MaybeStartEncoding;
 					StartSubtask(false);
 					try
-						writeln('writing #', outp.param^.index, ': ', outp.fn);
 						outp.f.Write(0, outp.data, outp.dataSize, &File.CompletionHandler(@GenericOp.OnEndWritingOutputFile), outp.param);
 					except
 						EndSubtask(false); raise;
@@ -4125,12 +4466,12 @@ type
 			ImageFormat.GA: lct := lodepng.CT_GREY_ALPHA;
 			ImageFormat.RGB: lct := lodepng.CT_RGB;
 			ImageFormat.RGBA: lct := lodepng.CT_RGBA;
-			else raise Exception.Create('Сохранение {} в PNG не поддерживается.'.Format([pl.im.format.ToString]));
+			else raise Exception.Create('Сохранение {} в PNG не поддерживается.'.Format([pl.im.format.id]));
 		end;
 
 		try
 			lcode := lodepng.encode_memory(encodedData, encodedSize,
-				pl.im.data + pl.im.w * pl.im.h * outp.frame,
+				pl.im.data + pl.im.format.pixelSize * pl.im.w * pl.im.h * outp.frame,
 				pl.im.w, pl.im.h, lct, bitsizeof(uint8), lodepng.Presets[lodepng.Good], lodepng.GlobalAllocator);
 		except
 			lodepng.island.Purge(ThreadID);
@@ -4180,66 +4521,717 @@ type
 	procedure GenericOp.MaybeComplete;
 	begin
 		Assert(lock.AcquiredAssert);
-		if pendingOutputs = 0 then stage := GlobalStage.Done;
+		if pendingOutputs = 0 then
+		begin
+			stage := GlobalStage.Done;
+			stat := Status.Completed;
+		end;
 	end;
 
 type
-	GenerateImage = class(GenericOpPayload)
+	MixOperation = class(GenericOpPayload)
+		inps: array of record
+			weight: float;
+		end;
+		iwsum: float;
+		procedure Start; override;
+		procedure GeneratePart(threadIndex, startPixel, endPixel: SizeUint); override;
+		class procedure ChooseOutputFormat(op: GenericOp; out w, h: SizeUint; out fmt: ImageFormat); static;
+	const
+		FormatEstimation: array[ImageFormat] of uint = (0, 1, 2, 3);
+		ReportPeriodPixels = 16384;
+	end;
+
+	procedure MixOperation.Start;
+	var
+		i: SizeInt;
+		rfmt: ImageFormat;
+		rw, rh: SizeUint;
+		wsum: float;
+	begin
+		if length(op.inputs) <= 1 then
+			raise Exception.Create('Недостаточно входных файлов для смешивания ({}).'.Format([length(op.inputs)]));
+		if length(inps) = 0 then
+		begin
+			SetLength(inps, length(op.inputs));
+			for i := 0 to High(inps) do inps[i].weight := 1.0;
+		end;
+		if length(op.inputs) <> length(inps) then
+			raise Exception.Create('Неверно заданы веса для смешивания.');
+
+		wsum := inps[0].weight;
+		for i := 1 to High(inps) do wsum += inps[i].weight;
+		for i := 0 to High(inps) do inps[i].weight /= wsum;
+
+		ChooseOutputFormat(op, rw, rh, rfmt);
+		im.Init(op.oname.name, nil, rw, rh, 1, rfmt);
+	end;
+
+	class procedure MixOperation.ChooseOutputFormat(op: GenericOp; out w, h: SizeUint; out fmt: ImageFormat);
+	var
+		refim, nim: pImage;
+		i: SizeInt;
+	begin
+		if length(op.inputs) = 0 then raise Exception.Create('Нет входных файлов.');
+		refim := @op.inputs[0].im^.im;
+		fmt := refim^.format;
+		for i := 1 to High(op.inputs) do
+		begin
+			nim := @op.inputs[i].im^.im;
+			if (refim^.w <> nim^.w) or (refim^.h <> nim^.h) then
+				raise Exception.Create('Размеры изображений {} и {} не совпадают: {}x{} <-> {}x{}.'.Format([op.inputs[0].name.orig, op.inputs[i].name.orig,
+					refim^.w, refim^.h, nim^.w, nim^.h]));
+			if FormatEstimation[nim^.format] > FormatEstimation[fmt] then fmt := op.inputs[i].im^.im.format;
+		end;
+		w := refim^.w;
+		h := refim^.h;
+	end;
+
+	procedure MixOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
+	var
+		pixel, x, y, f: SizeUint;
+		ofs: pointer;
+		linps: array of record
+			ofs: pointer;
+			fmt: ImageFormat;
+			pixelSize: SizeUint;
+		end;
+		i: SizeInt;
+		sum: Vec4;
+	begin
+		im.DecodePixelNumber(startPixel, x, y, f, ofs);
+		pixel := startPixel;
+		SetLength(linps, length(inps));
+		for i := 0 to High(linps) do
+		begin
+			linps[i].fmt := op.inputs[i].im^.im.format;
+			linps[i].pixelSize := linps[i].fmt.pixelSize;
+			linps[i].ofs := op.inputs[i].im^.im.data + linps[i].pixelSize * startPixel;
+		end;
+
+		while pixel < endPixel do
+		begin
+			sum := inps[0].weight * Image.ReadLinearRGBA(linps[0].ofs, linps[0].fmt);
+			for i := 1 to High(inps) do
+				sum += inps[i].weight * Image.ReadLinearRGBA(linps[i].ofs, linps[i].fmt);
+			Image.WriteLinearRGBA(ofs, im.format, sum);
+			inc(pixel);
+			ofs += im.format.pixelSize;
+			for i := 0 to High(linps) do linps[i].ofs += linps[i].pixelSize;
+			if pixel mod ReportPeriodPixels = 0 then op.NoteProgress(threadIndex, (pixel - startPixel) / (endPixel - startPixel));
+		end;
+	end;
+
+type
+	TweenOperation = class(GenericOpPayload)
+		inps: array of record
+			extraFrames: SizeUint;
+		end;
+		procedure Start; override;
+		procedure GeneratePart(threadIndex, startPixel, endPixel: SizeUint); override;
+		class procedure Tween(n: SizeUint; ap: pointer; af: ImageFormat; bp: pointer; bf: ImageFormat; outp: pointer; outf: ImageFormat; const w: float; op: GenericOpPayload; threadIndex: SizeUint; const progressBase, progressK: float); static;
+		class procedure Blit(n: SizeUint; inp: pointer; inf: ImageFormat; outp: pointer; outf: ImageFormat; op: GenericOpPayload; threadIndex: SizeUint; const progressBase, progressK: float); static;
+	end;
+
+	procedure TweenOperation.Start;
+	var
+		rfmt: ImageFormat;
+		rw, rh, frames: SizeUint;
+		i: SizeInt;
+	begin
+		if length(op.inputs) <= 1 then
+			raise Exception.Create('Недостаточно входных файлов для смешивания ({}).'.Format([length(op.inputs)]));
+		if length(inps) + 1 <> length(op.inputs) then
+			raise Exception.Create('Неверно заданы переходы: ожидается {}-1, получено {}.'.Format([length(op.inputs), length(inps)]));
+		MixOperation.ChooseOutputFormat(op, rw, rh, rfmt);
+		frames := 1;
+		for i := 0 to High(inps) do frames += 1 + inps[i].extraFrames;
+		im.Init(op.oname.name, nil, rw, rh, frames, rfmt);
+	end;
+
+	procedure TweenOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
+	var
+		pixel, x, y, f, endX, endY, endF, iframe, curA, curAFrame, batchPixels: SizeUint;
+		aOfs, bOfs, outOfs, endOfs: pointer;
+		progressBase, progressK: float;
+		procedure NextA;
+		begin
+			inc(curAFrame);
+			if curA = SizeUint(length(inps)) then
+				Assert(curAFrame = 1)
+			else if curAFrame > inps[curA].extraFrames then
+			begin
+				inc(curA);
+				curAFrame := 0;
+			end;
+		end;
+	begin
+		im.DecodePixelNumber(startPixel, x, y, f, outOfs);
+		im.DecodePixelNumber(endPixel, endX, endY, endF, endOfs);
+		curA := 0; curAFrame := 0;
+		for iframe := 1 to f do NextA;
+
+		pixel := startPixel;
+		while pixel < endPixel do
+		begin
+			batchPixels := im.w * im.h;
+			if pixel = startPixel then
+			begin
+				batchPixels -= pixel mod batchPixels; // первая картинка может начаться с середины
+				aOfs := op.inputs[curA].im^.im.PixelPtr(x, y, 0);
+				if curAFrame > 0 then bOfs := op.inputs[curA + 1].im^.im.PixelPtr(x, y, 0) else bOfs := nil;
+			end else
+			begin
+				aOfs := op.inputs[curA].im^.im.data;
+				if curAFrame > 0 then bOfs := op.inputs[curA + 1].im^.im.data else bOfs := nil;
+			end;
+
+			batchPixels := min(batchPixels, endPixel - pixel); // последняя картинка может оборваться на середине
+			progressBase := (pixel - startPixel) / (endPixel - startPixel);
+			progressK := batchPixels / (endPixel - startPixel);
+
+			if curAFrame = 0 then
+				Blit(batchPixels, aOfs, op.inputs[curA].im^.im.format, outOfs, im.format, self, threadIndex, progressBase, progressK)
+			else
+				Tween(batchPixels, aOfs, op.inputs[curA].im^.im.format, bOfs, op.inputs[curA + 1].im^.im.format, outOfs, im.format, curAFrame / (1 + inps[curA].extraFrames),
+					self, threadIndex, progressBase, progressK);
+
+			pixel += batchPixels;
+			outOfs += batchPixels * im.format.pixelSize;
+			NextA;
+		end;
+	end;
+
+	class procedure TweenOperation.Tween(n: SizeUint; ap: pointer; af: ImageFormat; bp: pointer; bf: ImageFormat; outp: pointer; outf: ImageFormat;
+		const w: float; op: GenericOpPayload; threadIndex: SizeUint; const progressBase, progressK: float);
+	var
+		apsz, bpsz, outpsz, startn: SizeUint;
+		w2: float;
+
+		procedure RGBShortcut(n: SizeUint; ap: pointer; apsz: SizeUint; bp: pointer; bpsz: SizeUint; outp: pointer; outpsz: SizeUint;
+			const w, w2: float; const progressBase, progressK: float);
+		begin
+			while n > 0 do
+			begin
+				p4x8(outp)^[0] := round(Image.ApplyGamma(w2 * Image.UnapplyGamma(p4x8(ap)^[0]) + w * Image.UnapplyGamma(p4x8(bp)^[0])));
+				p4x8(outp)^[1] := round(Image.ApplyGamma(w2 * Image.UnapplyGamma(p4x8(ap)^[1]) + w * Image.UnapplyGamma(p4x8(bp)^[1])));
+				p4x8(outp)^[2] := round(Image.ApplyGamma(w2 * Image.UnapplyGamma(p4x8(ap)^[2]) + w * Image.UnapplyGamma(p4x8(bp)^[2])));
+				ap += apsz; bp += bpsz; outp += outpsz; dec(n);
+				if n mod MixOperation.ReportPeriodPixels = 0 then op.op.NoteProgress(threadIndex, progressBase + (1 - n/startn) * progressK);
+			end;
+		end;
+
+		procedure RGBA_AlphaShortcut_Tween(n: SizeUint; ap: pointer; bp: pointer; outp: pointer;
+			const w, w2: float; const progressBase, progressK: float);
+		begin
+			while n > 0 do
+			begin
+				p4x8(outp)^[3] := Image.Denorm8(w2 * p4x8(ap)^[3] * Image.Norm8 + w * Image.Denorm8(p4x8(bp)^[3]) * Image.Norm8);
+				ap += sizeof(_4x8); bp += sizeof(_4x8); outp += sizeof(_4x8); dec(n);
+				if n mod MixOperation.ReportPeriodPixels = 0 then op.op.NoteProgress(threadIndex, progressBase + (1 - n/startn) * progressK);
+			end;
+		end;
+
+		procedure RGBA_AlphaShortcut_TweenTo1(n: SizeUint; ap: pointer; outp: pointer;
+			const w, w2: float; const progressBase, progressK: float);
+		begin
+			while n > 0 do
+			begin
+				p4x8(outp)^[3] := Image.Denorm8(w2 * p4x8(ap)^[3] * Image.Norm8 + w);
+				ap += sizeof(_4x8); outp += sizeof(_4x8); dec(n);
+				if n mod MixOperation.ReportPeriodPixels = 0 then op.op.NoteProgress(threadIndex, progressBase + (1 - n/startn) * progressK);
+			end;
+		end;
+
+		procedure RGBA_AlphaShortcut_Set1(n: SizeUint; outp: pointer; const progressBase, progressK: float);
+		begin
+			while n > 0 do
+			begin
+				p4x8(outp)^[3] := High(uint8);
+				outp += sizeof(_4x8); dec(n);
+				if n mod MixOperation.ReportPeriodPixels = 0 then op.op.NoteProgress(threadIndex, progressBase + (1 - n/startn) * progressK);
+			end;
+		end;
+
+	begin
+		apsz := ImageFormatHelper.Info[af].pixelSize; bpsz := ImageFormatHelper.Info[bf].pixelSize; outpsz := ImageFormatHelper.Info[outf].pixelSize; w2 := 1 - w; startn := n;
+		if ([af, bf, outf] <= [ImageFormat.RGB, ImageFormat.RGBA]) then
+		begin
+			RGBShortcut(n, ap, apsz, bp, bpsz, outp, outpsz, w, w2, progressBase, progressK * IfThen(outf = ImageFormat.RGBA, 3/4, 1));
+			if outf = ImageFormat.RGBA then
+			begin
+				if (af = ImageFormat.RGBA) and (bf = ImageFormat.RGBA) then RGBA_AlphaShortcut_Tween(n, ap, bp, outp, w, w2, progressBase + 3/4/progressK, 1/4*progressK)
+				else if af = ImageFormat.RGBA then RGBA_AlphaShortcut_TweenTo1(n, ap, outp, w, w2, progressBase + 3/4*progressK, 1/4*progressK)
+				else if bf = ImageFormat.RGBA then RGBA_AlphaShortcut_TweenTo1(n, bp, outp, w2, w, progressBase + 3/4*progressK, 1/4*progressK)
+				else RGBA_AlphaShortcut_Set1(n, outp, progressBase + 3/4/progressK, 1/4*progressK);
+			end;
+			exit;
+		end;
+
+		while n > 0 do
+		begin
+			Image.WriteLinearRGBA(outp, outf, w2 * Image.ReadLinearRGBA(ap, af) + w * Image.ReadLinearRGBA(bp, bf));
+			ap += apsz; bp += bpsz; outp += outpsz; dec(n);
+			if n mod MixOperation.ReportPeriodPixels = 0 then op.op.NoteProgress(threadIndex, progressBase + (1 - n/startn) * progressK);
+		end;
+	end;
+
+	class procedure TweenOperation.Blit(n: SizeUint; inp: pointer; inf: ImageFormat; outp: pointer; outf: ImageFormat; op: GenericOpPayload; threadIndex: SizeUint; const progressBase, progressK: float);
+	var
+		inpsz, outpsz, startn: SizeUint;
+	begin
+		inpsz := ImageFormatHelper.Info[inf].pixelSize; outpsz := ImageFormatHelper.Info[outf].pixelSize; startn := n;
+		if inf = outf then
+		begin
+			Move(inp^, outp^, n * inpsz);
+			exit;
+		end;
+
+		while n > 0 do
+		begin
+			Image.WriteLinearRGBA(outp, outf, Image.ReadLinearRGBA(inp, inf));
+			inp += inpsz; outp += outpsz; dec(n);
+			if n mod MixOperation.ReportPeriodPixels = 0 then op.op.NoteProgress(threadIndex, progressBase + (1 - n/startn) * progressK);
+		end;
+	end;
+
+type
+	lua = object
+	type
+		State = ^State_; State_ = record end;
+		Number = type double; pNumber = ^Number;
+		Integer = {$ifdef CPU32} cint {$else} clonglong {$endif};
+		CFunction = function(L: State): cint; cdecl;
+		KContext = PtrInt;
+		KFunction = function(L: State; status: cint; ctx: KContext): cint; cdecl;
+		ChunkReader = function(L: State; ud: pointer; out sz: csize_t): PChar; cdecl;
+		ChunkWriter = function(L: State; p: pointer; sz: csize_t; ud: pointer): cint; cdecl;
+		Alloc = function(ud: pointer; ptr: pointer; osize, nsize: csize_t): pointer; cdecl;
+
+		// модификации: пользовательские функции для error и pcall
+		Throw = procedure; cdecl;
+		PFunc = procedure(L: State; ud: pointer); cdecl;
+		PCallf = function(f: PFunc; L: State; ud: pointer): cint; cdecl;
+
+	const
+		OK        = 0;
+		YIELDED   = 1;
+		ERRRUN    = 2;
+		ERRSYNTAX = 3;
+		ERRMEM    = 4;
+		ERRGCMM   = 5;
+		ERRERR    = 6;
+
+		MULTRET = -1;
+		FIRSTPSEUDOIDX = -1001000;
+		REGISTRYINDEX = FIRSTPSEUDOIDX;
+
+		RIDX_MAINTHREAD = 1;
+		RIDX_GLOBALS = 2; RIDX_LAST = RIDX_GLOBALS;
+
+		TNONE = -1;
+		TNIL = 0;
+		TBOOLEAN = 1;
+		TLIGHTUSERDATA = 2;
+		TNUMBER = 3;
+		TSTRING = 4;
+		TTABLE = 5;
+		TFUNCTION = 6;
+		TUSERDATA = 7;
+		TTHREAD = 8;
+
+	class var
+		lib: DLL;
+		newstate: function(f: Alloc; ud: pointer): State; cdecl;
+		close: procedure(L: State); cdecl;
+		atpanic: function(L: State; panicf: CFunction): CFunction; cdecl;
+		onthrow: procedure(L: State; throwf: Throw; pcallf: PCallf); cdecl;
+
+		gettop: function(L: State): cint; cdecl;
+		settop: procedure(L: State; idx: cint); cdecl;
+		pushvalue: procedure(L: State; idx: cint); cdecl;
+		rotate: procedure(L: State; idx, n: cint); cdecl;
+		copy: procedure(L: State; fromidx, toidx: cint); cdecl;
+		absindex: function(L: State; idx: cint): cint; cdecl;
+
+		isnumber: function(L: State; idx: cint): LongBool; cdecl;
+		isinteger: function(L: State; idx: cint): LongBool; cdecl;
+		isuserdata: function(L: State; idx: cint): LongBool; cdecl;
+		iscfunction: function(L: State; idx: cint): LongBool; cdecl;
+		&type: function(L: State; idx: cint): cint; cdecl;
+		typename: function(L: State; tp: cint): PChar; cdecl;
+		tonumberx: function(L: State; idx: cint; isnum: pcint): Number; cdecl;
+		tointegerx: function(L: State; idx: cint; isnum: pcint): cint; cdecl;
+		toboolean: function(L: State; idx: cint): LongBool; cdecl;
+		tolstring: function(L: State; idx: cint; len: pcsize_t): PChar; cdecl;
+		touserdata: function(L: State; idx: cint): pointer; cdecl;
+		rawlen: function(L: State; idx: cint): csize_t; cdecl;
+		rawequal: function(l: State; index1, index2: cint): LongBool; cdecl;
+
+		pushnil: procedure(L: State); cdecl;
+		pushnumber: procedure(L: State; n: Number); cdecl;
+		pushinteger: procedure(L: State; n: cint); cdecl;
+		pushlstring: procedure(L: State; s: PChar; ls: csize_t); cdecl;
+		pushcclosure: procedure(L: State; fn: CFunction; n: cint); cdecl;
+		pushboolean: procedure(L: State; b: LongBool); cdecl;
+		pushlightuserdata: procedure(L: State; p: pointer); cdecl;
+		createtable: procedure(l: State; narr, nrec: cint); cdecl;
+		newuserdata: function(L: State; sz: csize_t): pointer; cdecl;
+
+		getfield: procedure(l: State; index: cint; k: pChar); cdecl;
+		rawget: procedure(L: State; idx: cint); cdecl;
+		rawgeti: procedure(L: State; idx, n: cint); cdecl;
+		rawgetp: procedure(L: State; idxn: cint; p: pointer); cdecl;
+		getmetatable: function(L: State; objindex: cint): cint; cdecl;
+		getuservalue: procedure(L: State; index: cint); cdecl;
+
+		setfield: procedure(l: State; index: cint; k: pChar); cdecl;
+		rawset: procedure(L: State; idx: cint); cdecl;
+		rawseti: procedure(L: State; idx, n: cint); cdecl;
+		rawsetp: procedure(L: State; idx: cint; p: pointer); cdecl;
+		setmetatable: function(L: State; objindex: cint): LongBool; cdecl;
+		setuservalue: procedure(L: State; index: cint); cdecl;
+		setupvalue: function(L: State; funcindex, n: cint): PChar; cdecl;
+
+		callk: procedure(L: State; nargs, nresults: cint; ctx: KContext; k: KFunction); cdecl;
+		pcallk: function(L: State; nargs, nresults, errfunc: cint; ctx: KContext; k: KFunction): cint; cdecl;
+		error: function(L: State): cint; cdecl;
+
+		load_: function(L: State; reader: Chunkreader; dt: pointer; chunkname, mode: PChar): cint; cdecl;
+
+		class procedure Load(const fn: string); static;
+		class procedure Unload; static;
+
+		class procedure pop(L: State; n: cint = 1); static;
+		class procedure remove(L: State; idx: cint); static;
+		class procedure insert(L: State; idx: cint); static;
+		class procedure replace(L: State; idx: cint); static;
+
+		class function topchar(L: State; idx: cint): pChar; static;
+		class function tostring(L: State; idx: cint): string; reintroduce; static;
+		class function tonumber(L: State; idx: cint): Number; static;
+		class function isfunction(L: State; idx: cint): boolean; static;
+		class function istable(L: State; idx: cint): boolean; static;
+		class function islightuserdata(L: State; idx: cint): boolean; static;
+		class function isnil(L: State; idx: cint): boolean; static;
+		class function isboolean(L: State; idx: cint): boolean; static;
+
+		class procedure newtable(L: State); static;
+
+		class procedure call(L: State; nargs, nresults: cint); static;
+		class function pcall(L: State; nargs, nresults, errfunc: cint): cint; static;
+		class function userparam(L: State): pPointer; static;
+
+		class procedure pushstring(L: State; const s: string); static;
+		class function loadstring(L: State; const parts: array of string; const name: string; errmsg: pString): boolean; static;
+
+		class function default_allocf(ud: pointer; ptr: pointer; osize, nsize: csize_t): pointer; cdecl;
+		class procedure default_throwf; cdecl;
+		class function default_pcallf(f: PFunc; L: State; ud: pointer): cint; cdecl;
+		class function default_panic(L: State): cint; cdecl;
+
+	strict private type
+		InternalThrow = class end;
+
+		loadstring_ReaderParam = record
+			parts: pString;
+			next, total: SizeInt;
+		end;
+		class function loadstring_reader(L: lua.State; ud: pointer; out sz: csize_t): pChar; cdecl;
+	end;
+
+	class procedure lua.Load(const fn: string);
+	begin
+		try
+			lib.Load(fn).Prefix('lua_').Func('newstate', newstate).Func('close', close).Func('atpanic', atpanic).Func('onthrow', onthrow)
+				.Func('gettop', gettop).Func('settop', settop).Func('pushvalue', pushvalue).Func('rotate', rotate).Func('copy', copy).Func('absindex', absindex)
+				.Func('isnumber', isnumber).Func('isinteger', isinteger).Func('isuserdata', isuserdata).Func('iscfunction', iscfunction)
+				.Func('type', &type).Func('typename', typename)
+				.Func('tonumberx', tonumberx).Func('tointegerx', tointegerx).Func('toboolean', toboolean).Func('tolstring', tolstring).Func('touserdata', touserdata)
+				.Func('rawlen', rawlen).Func('rawequal', rawequal)
+				.Func('pushnil', pushnil).Func('pushnumber', pushnumber).Func('pushinteger', pushinteger).Func('pushlstring', pushlstring).Func('pushcclosure', pushcclosure)
+				.Func('pushboolean', pushboolean).Func('pushlightuserdata', pushlightuserdata).Func('createtable', createtable).Func('newuserdata', newuserdata)
+				.Func('getfield', getfield).Func('rawget', rawget).Func('rawgeti', rawgeti).Func('rawgetp', rawgetp).Func('getmetatable', getmetatable).Func('getuservalue', getuservalue)
+				.Func('setfield', setfield).Func('rawset', rawset).Func('rawseti', rawseti).Func('rawsetp', rawsetp).Func('setmetatable', setmetatable).Func('setuservalue', setuservalue).Func('setupvalue', setupvalue)
+				.Func('callk', callk).Func('pcallk', pcallk).Func('error', error)
+				.Func('load', load_);
+		except
+			Unload;
+			raise;
+		end;
+	end;
+
+	class procedure lua.Unload;
+	begin
+		lib.Unload;
+	end;
+
+	class procedure lua.pop(L: State; n: cint = 1);
+	begin
+		settop(L, -n - 1);
+	end;
+
+	class procedure lua.remove(L: State; idx: cint);
+	begin
+		rotate(L, idx, -1);
+		settop(L, -2);
+	end;
+
+	class procedure lua.insert(L: State; idx: cint);
+	begin
+		rotate(L, idx, 1);
+	end;
+
+	class procedure lua.replace(L: State; idx: cint);
+	begin
+		copy(L, -1, idx);
+		settop(L, -2);
+	end;
+
+	class function lua.topchar(L: State; idx: cint): pChar;
+	begin
+		result := tolstring(L, idx, nil);
+	end;
+
+	class function lua.tostring(L: State; idx: cint): string;
+	var
+		ch: pchar;
+		len: csize_t;
+	begin
+		ch := tolstring(L, idx, @len); Assert(Assigned(ch));
+		SetLength(result, len);
+		Move(ch^, pointer(result)^, len * sizeof(char));
+	end;
+
+	class function lua.tonumber(L: State; idx: cint): Number;
+	begin
+		result := tonumberx(L, idx, nil);
+	end;
+
+{$define isimpl := begin result := &type(L, idx) = tag; end; {$undef tag}}
+	class function lua.isfunction(L: State; idx: cint): boolean; {$define tag := TFUNCTION} isimpl
+	class function lua.istable(L: State; idx: cint): boolean; {$define tag := TTABLE} isimpl
+	class function lua.islightuserdata(L: State; idx: cint): boolean; {$define tag := TLIGHTUSERDATA} isimpl
+	class function lua.isnil(L: State; idx: cint): boolean; static; {$define tag := TNIL} isimpl
+	class function lua.isboolean(L: State; idx: cint): boolean; static; {$define tag := TBOOLEAN} isimpl
+{$undef isimpl}
+
+	class procedure lua.newtable(L: State);
+	begin
+		createtable(L, 0, 0);
+	end;
+
+	class procedure lua.call(L: State; nargs, nresults: cint);
+	begin
+		callk(L, nargs, nresults, 0, nil);
+	end;
+
+	class function lua.pcall(L: State; nargs, nresults, errfunc: cint): cint;
+	begin
+		result := pcallk(L, nargs, nresults, errfunc, 0, nil);
+	end;
+
+	class function lua.userparam(L: State): pPointer;
+	begin
+		result := pPointer(L) - 1;
+	end;
+
+	class procedure lua.pushstring(L: State; const s: string);
+	begin
+		pushlstring(L, pChar(s), length(s));
+	end;
+
+	class function lua.loadstring_Reader(L: lua.State; ud: pointer; out sz: csize_t): PChar; cdecl;
+	var
+		r: ^loadstring_ReaderParam absolute ud;
+		cur: SizeInt;
+	begin {$define args := L} unused_args
+		while r^.next < r^.total do
+		begin
+			cur := r^.next;
+			inc(r^.next);
+			if length(r^.parts[cur]) > 0 then
+			begin
+				sz := length(r^.parts[cur]) * sizeof(r^.parts[cur, 1]);
+				exit(pointer(r^.parts[cur]));
+			end;
+		end;
+		sz := 0; result := nil;
+	end;
+
+	class function lua.loadstring(L: State; const parts: array of string; const name: string; errmsg: pString): boolean;
+	var
+		rr: loadstring_ReaderParam;
+	begin
+		rr.parts := pString(parts);
+		rr.next := 0;
+		rr.total := length(parts);
+		result := load_(L, ChunkReader(@lua.loadstring_reader), @rr, pChar('=' + name), nil) = OK;
+		if not result then
+		begin
+			if Assigned(errmsg) then errmsg^ := tostring(L, -1);
+			pop(L);
+		end;
+	end;
+
+	class function lua.default_allocf(ud: pointer; ptr: pointer; osize, nsize: csize_t): pointer; cdecl;
+	begin {$define args := ud _ osize} unused_args
+		result := ReallocMem(ptr, nsize);
+	end;
+
+	class procedure lua.default_throwf; cdecl;
+	begin
+		raise InternalThrow.Create;
+	end;
+
+	class function lua.default_pcallf(f: PFunc; L: State; ud: pointer): cint; cdecl;
+	begin
+		try
+			f(L, ud);
+			result := 1;
+		except
+			on InternalThrow do result := 0;
+		end;
+	end;
+
+	class function lua.default_panic(L: lua.State): cint; cdecl;
+	begin {$define args := result} unused_args
+		raise Exception.Create(tostring(L, -1));
+	end;
+
+type
+	GenerateByFormulaOperation = class(GenericOpPayload)
+	type
+		GetPixelProc = procedure(x, y, f: SizeUint; out color: Vec4; var im: Image; param: pointer);
+	var
+		getPixel: GetPixelProc;
+		param: pointer;
+		w, h, frames: SizeUint;
+		format: ImageFormat;
 		procedure Start; override;
 		procedure GeneratePart(threadIndex, startPixel, endPixel: SizeUint); override;
 	end;
 
-	procedure GenerateImage.Start;
+	procedure GenerateByFormulaOperation.Start;
 	begin
-		im.Init('test', nil, 2048, 2048, 20, ImageFormat.RGB);
+		im.Init(op.oname.name, nil, w, h, frames, format);
 	end;
 
-	procedure GenerateImage.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
+	procedure GenerateByFormulaOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
+	var
+		x, y, f, pixel: SizeUint;
+		color: Vec4;
+		outOfs: pointer;
+	begin
+		im.DecodePixelNumber(startPixel, x, y, f, outOfs);
+		pixel := startPixel;
+		while pixel < endPixel do
+		begin
+			getPixel(x, y, f, color, im, param);
+			Image.WriteRGBA(outOfs, im.format, color);
+			im.NextPixel(pixel, x, y, f);
+			outOfs += im.format.pixelSize;
+			if pixel mod MixOperation.ReportPeriodPixels = 0 then op.NoteProgress(threadIndex, (pixel - startPixel) / (endPixel - startPixel));
+		end;
+	end;
+
+	procedure GetPixel(x, y, f: SizeUint; out color: Vec4; var im: Image; param: pointer);
+	begin {$define args := f _ param} unused_args
+		color.x := clamp(sqr(1 - abs(1 - (x/im.w + y/im.h))), 0, 1);
+		color.y := clamp(1 - sqrt(abs(x/im.w-0.5)) - sqrt(abs(y/im.h-0.5)), 0, 1);
+		color.z := clamp(1 - 4*sqr(x/im.w-0.5) - 4*sqr(y/im.h-0.5), 0, 1);
+		color.w := 1;
+	end;
+
+type
+	GenerateByScriptFormulaOperation = class(GenericOpPayload)
+		lock: ThreadLock;
+		fileSourceIndex: SizeInt;
+		source, funcName: string;
+
+		// в этом стейте вызывается init, затем функция для первого пикселя, чтобы по тому, что она вернёт, определить формат,
+		// в дальнейшем этот стейт используется потоком 0, остальные создают себе отдельные.
+		L0: lua.State;
+
+		constructor Create;
+		destructor Destroy; override;
+		procedure Start; override;
+		procedure GeneratePart(threadIndex, startPixel, endPixel: SizeUint); override;
+	private const
+		Reg_Vec2MT = lua.RIDX_LAST + 1;
+		Reg_Vec3MT = Reg_Vec2MT + 1;
+		Reg_Vec4MT = Reg_Vec3MT + 1;
+		Reg_ImageMT = Reg_Vec4MT + 1;
+	end;
+
+	constructor GenerateByScriptFormulaOperation.Create;
+	begin
+		inherited Create;
+		lock.Init;
+		fileSourceIndex := -1;
+	end;
+
+	destructor GenerateByScriptFormulaOperation.Destroy;
+	begin
+		lock.Done;
+		inherited Destroy;
+	end;
+
+	procedure GenerateByScriptFormulaOperation.Start;
+	begin
+	end;
+
+	procedure GenerateByScriptFormulaOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
 	begin
 	end;
 
 var
 	ir: ImageRegistry;
 	op: GenericOp;
-	pl: GenericOpPayload;
-	i: SizeInt;
+	pl: GenerateByFormulaOperation;
+	t: ticks;
 
 begin
 	try
 		try
 			lodepng.Load('{}lib\{}\lodepng.dll'.Format([ExecRoot, CPUArch]));
-			ir.Init;
+			lua.Load('{}lib\{}\lua.dll'.Format([ExecRoot, CPUArch]));
 			try
-				pl := GenerateImage.Create;
+				ir.Init;
+				pl := GenerateByFormulaOperation.Create;
+				pl.getPixel := @GetPixel;
+				pl.param := pl;
+				pl.w := 2048;
+				pl.h := 2048;
+				pl.frames := 1;
+				pl.format := ImageFormat.RGBA;
 				op := GenericOp.Create(ir, @pl);
-				op.AddInput(ImageName.Parse('E:\aa\0eebf8f4a369451f163c05b674ba5164.png'), false);
-				op.AddInput(ImageName.Parse('E:\aa\2ebcad37901decdc86cd0a74f9dd4bc8.png'), false);
-				op.AddInput(ImageName.Parse('E:\aa\3a113c6b0dbae5b24d6908216ba138aa.png'), false);
-				op.AddInput(ImageName.Parse('E:\aa\4f3173b1abe2f8c2608c9bf0cf25e3cd.png'), false);
-				op.AddInput(ImageName.Parse('E:\dev\shu-svn\shu-work\config.lua'), true);
 				op.oname := ImageName.Parse('result%f%.png');
+				t := ticks.get;
 				op.Run;
-				op.Wait;
+				op.lock.Enter;
+				try
+					while (op.stat = op.Status.Running) do op.hey.Wait(op.lock);
+				finally
+					op.lock.Leave;
+				end;
+				t := ticks.get-t;
 				Con.ResetCtrlC;
-				if op.stat = op.Status.OK then
-				begin
-					Con.ColoredLine('<g>OK!');
-					for i := 0 to High(op.inputs) do
-						if op.inputs[i].onlyRead then
-							Con.ColoredLine('<g>{}b'.Format([op.inputs[i].dataSize]))
-						else
-							Con.ColoredLine('<g>{}x{}x{}@{}'.Format([op.inputs[i].im^.im.w, op.inputs[i].im^.im.h, op.inputs[i].im^.im.frames, op.inputs[i].im^.im.format.ToString]));
-				end else
+				writeln(seconds(t):0:2);
+				if op.stat = op.Status.Completed then
+					Con.ColoredLine('<g>OK!')
+				else
 				if op.stat = op.Status.Cancelled then
 					Con.ColoredLine('<gb>Операция прервана.')
-				else if op.stat = op.Status.Failed then
-					Con.ColoredLine('<R>' + Con.Escape(op.err));
+				else
+					Con.ColoredLine('<R>' + Con.Escape(IfThen(op.err <> '', op.err, 'Что-то не так.')));
 			finally
 				pl.Free(pl);
 				op.Free(op);
+				ir.Done;
 			end;
-			ir.Done;
 		finally
+			lua.Unload;
 			lodepng.Unload;
 		end;
 	except
