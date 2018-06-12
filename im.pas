@@ -1,6 +1,7 @@
 {$mode objfpc} {$h+} {$typedaddress+} {$macro on} {$modeswitch duplicatelocals+} {$modeswitch typehelpers+} {$scopedenums+}
 {$modeswitch advancedrecords}
 {$ifdef assert} {$error} {$endif} {$ifopt Q+} {$define assert} {$endif}
+{$define suppress_false_dfa_alarms}
 {$warn 2005 off} // comment level 2 found
 {$R *.res}
 program im;
@@ -99,7 +100,24 @@ type
 	end; {$undef default_no} {$ifndef keep_typename} {$undef typename} {$endif}}
 
 {$define impl :=
-	function ToString(const x: typename): string; begin str(x, result); end;
+	function ToString(const x: typename): string;
+	{$ifdef floating} var len: SizeInt; {$endif}
+	begin
+	{$ifdef floating}
+		if (x = 0) or (abs(x) > 0.1) then str(x:0:2, result)
+		else if abs(x) > 0.001 then str(x:0:4, result)
+		else if abs(x) > 0.00001 then str(x:0:6, result)
+		else begin str(x, result); exit; end;
+
+		len := length(result);
+		while result[len] = '0' do dec(len);
+		if result[len] = '.' then dec(len);
+		delete(result, len + 1, length(result) - len);
+	{$else}
+		str(x, result);
+	{$endif}
+	end;
+
 	function TryParse(const s: string; out v: typename; wrong: pSizeInt = nil): boolean;
 	var
 		code: word;
@@ -111,8 +129,28 @@ type
 
 	function min(const a, b: typename): typename; begin if a <= b then result := a else result := b; end;
 	function max(const a, b: typename): typename; begin if a >= b then result := a else result := b; end;
-	{$ifdef integer} function RoundUp(x, m: typename): typename; begin result := x + (m - x mod m) mod m; end; {$endif}
 	{$define keep_typename} {$define default_no := 0} ifthenimpl {$undef keep_typename}
+
+	function clamp(const x, a, b: typename): typename;
+	begin
+		if (x >= a) and (x <= b) then result := x else
+			if x > a then result := b else result := a;
+	end;
+
+{$ifdef floating}
+	function lerp(const a, b, x: typename): typename;
+	begin
+		result := a * (1 - x) + b * x;
+	end;
+
+	function smoothstep(const a, b, x: typename): typename;
+	var
+		t: typename;
+	begin
+		t := clamp((x - a) / (b - a), 0, 1);
+		result := t * t * (3 - 2*t);
+	end;
+{$endif}
 
 	{$undef typename}
 	{$ifndef keep_integer} {$undef integer} {$endif}
@@ -128,12 +166,6 @@ type
 {$define typename := string} {$define default_no := ''} ifthenimpl
 {$define typename := pointer} ifthenimpl
 {$undef ifthenimpl}
-
-	function clamp(const x, a, b: float): float;
-	begin
-		if (x >= a) and (x <= b) then result := x else
-			if x > a then result := b else result := a;
-	end;
 
 	function pow(const base, exponent: float): float;
 	begin
@@ -159,10 +191,6 @@ type
 		class function Current: TObject; static;
 		class function Message(obj: TObject): string; static;
 		class function Message: string; static;
-	end;
-
-	LogicError = class(Exception)
-		procedure AfterConstruction; override;
 	end;
 
 	Interception = class(Exception) end;
@@ -527,7 +555,7 @@ type
 		procedure Write(const at: FilePos; buf: pointer; size: SizeUint; onDone: CompletionHandler = nil; param: pointer = nil);
 		function Size: FileSize;
 		function CancelPendingIO: boolean;
-		class procedure Erase(const fn: string);
+		class procedure Erase(const fn: string); static;
 
 	const
 		RW = [Readable, Writeable];
@@ -656,7 +684,8 @@ type
 	public const
 		UTFInvalid = High(UTFchar);
 		Tab = #9;
-		AsciiSpaces = [Tab, ' '];
+		AsciiSpaces = [Tab, ' ', #13, #10];
+		UTF8BOM = #$EF#$BB#$BF;
 
 	type
 		PAnsiRec = ^TAnsiRec;
@@ -678,6 +707,8 @@ type
 
 	FilePathHelper = type helper for FilePath
 		function Path: FilePath;
+		function Filename: string;
+		function FilenameWoExt: string;
 		function Extension: string;
 	end;
 
@@ -690,6 +721,7 @@ type
 
 {$define vecf :=
 type
+	pvec = ^vec;
 	vec = record
 	type
 		LinearData = array[0 .. veclen - 1] of float;
@@ -704,6 +736,7 @@ type
 		function ToString: string;
 		function Length: float;
 		function SquareLength: float;
+		function Normalized: vec;
 	{$if veclen = 4} function xyz: Vec3; {$endif}
 	{$define iterate := property item: float read data[itemid] write data[itemid];} foreach_component
 	end;} all_vectors
@@ -725,13 +758,14 @@ type
 		class function Win32ExceptionFilter(ExceptionInfo: PEXCEPTION_POINTERS): Windows.LONG; stdcall; static;
 		// не собирает трейс, просто печатает сообщение и убивает процесс
 		class procedure Die(const msg: string; exitcode: Windows.UINT = 1); noreturn; static;
+		class procedure Impossible(const what: string); noreturn; static;
 		class procedure TestHacks; static;
 	end;
 
 var
 	SingletonLock: ThreadLock;
 	Con: Console;
-	ExecRoot: string;
+	Executable: FilePath;
 	MainThreadID: TThreadID;
 	CPUCount, PageSize: SizeUint;
 
@@ -748,7 +782,7 @@ var
 
 	class function Exception.Current: TObject;
 	begin
-		if not Assigned(RaiseList) then raise LogicError.Create('Exception.Current вызвана вне блока обработки исключения.');
+		if not Assigned(RaiseList) then Session.Impossible('Exception.Current вызвана вне блока обработки исключения.');
 		result := RaiseList[0].FObject;
 	end;
 
@@ -762,12 +796,6 @@ var
 	class function Exception.Message: string;
 	begin
 		result := Message(Current);
-	end;
-
-	procedure LogicError.AfterConstruction;
-	begin
-		inherited;
-		msg := 'Программная ошибка. ' + msg;
 	end;
 
 	procedure InvisibleInterception.AfterConstruction;
@@ -890,8 +918,6 @@ var
 	end;
 
 	class procedure Win32.Init;
-	var
-		exe: FilePath;
 	begin
 		k32.Load(kernel32).Func('CreateThreadpoolIo', CreateThreadpoolIo).Func('Close*', CloseThreadpoolIo).
 			Func('Start*', StartThreadpoolIo).Func('Cancel*', CancelThreadpoolIo).
@@ -903,8 +929,7 @@ var
 			Func('InitializeConditionVariable', InitializeConditionVariable).
 			Func('WakeAll*', WakeAllConditionVariable).Func('Wake*', WakeConditionVariable).
 			Func('Sleep*SRW', SleepConditionVariableSRW);
-		exe := QueryString(QueryStringCallback(@Win32.QueryModuleFileName), nil, 'имени исполняемого файла').ToUTF8;
-		ExecRoot := exe.Path;
+		Executable := QueryString(QueryStringCallback(@Win32.QueryModuleFileName), nil, 'имени исполняемого файла').ToUTF8;
 	end;
 
 	class procedure Win32.Done;
@@ -1512,7 +1537,7 @@ var
 	class procedure Console.DieTask(param: pointer);
 	begin {$define args := param} unused_args
 		Con.BypassStickForCurrentThread;
-		Session.Die('Получен{0:-/ы/о} {} сигнал{/а/ов} Ctrl-C за {1}секунд{2:у/ы/}; жёсткое завершение.'.Format(
+		Session.Die('Получен{/ы/о} {} сигнал{/а/ов} Ctrl-C за {1}секунд{2:у/ы/}; жёсткое завершение.'.Format(
 			[MinCtrlCsForHardShutdown, IfThen(round(CtrlCPeriod) <> 1, '{} ', '').Format([round(CtrlCPeriod)]), round(CtrlCPeriod)]));
 	end;
 
@@ -1765,7 +1790,7 @@ var
 			else disp := CREATE_ALWAYS
 		else
 		begin
-			if New in flags then raise LogicError.Create('{}: New + RO?'.Format([fn]));
+			if New in flags then Session.Impossible('{}: New + RO?'.Format([fn]));
 			disp := OPEN_EXISTING;
 		end;
 
@@ -2243,7 +2268,7 @@ var
 		end;
 
 	begin
-		result := ''; start := 1; p := 1; next := 0; last := -1;
+		result := ''; start := 1; p := 1; next := 0; last := 0;
 		while p <= length(self) do
 		begin
 			if self[p] = '{' then
@@ -2281,7 +2306,7 @@ var
 		case &to of
 			&Case.Lower: result := System.LowerCase(self.ToUTF16).ToUTF8;
 			&Case.Upper: result := System.UpCase(self.ToUTF16).ToUTF8;
-			else raise LogicError.Create('Case = {}'.Format([ord(&to)]));
+			else Session.Impossible('Case = {}'.Format([ord(&to)]));
 		end;
 	end;
 	function StringHelper.Uppercase: string; begin result := ConvertCase(&Case.Upper); end;
@@ -2414,16 +2439,25 @@ var
 		result := string(self).Head(string(self).ConsumeRevUntil(['/', '\'], length(self)));
 	end;
 
+	function FilePathHelper.Filename: string;
+	begin
+		result := string(self).Tail(string(self).ConsumeRevUntil(['/', '\'], length(self)) + 1);
+	end;
+
+	function FilePathHelper.FilenameWoExt: string;
+	var
+		p: SizeInt;
+	begin
+		p := string(self).ConsumeRevUntil(['/', '\', '.'], length(self));
+		if (p > 0) and (self[p] = '.') then result := string(self).AB(string(self).ConsumeRevUntil(['/', '\'], p) + 1, p) else result := string(self).Tail(p + 1);
+	end;
+
 	function FilePathHelper.Extension: string;
 	var
 		p: SizeInt;
 	begin
-		for p := length(self) downto 1 do
-			case self[p] of
-				'\', '/': break;
-				'.': exit(string(self).Tail(p + 1));
-			end;
-		result := '';
+		p := string(self).ConsumeRevUntil(['/', '\', '.'], length(self));
+		if (p > 0) and (self[p] = '.') then result := string(self).Tail(p + 1) else result := '';
 	end;
 
 	class function VarRec.VTypeToString(vt: SizeInt): string;
@@ -2441,8 +2475,9 @@ var
 			vtInteger: result := im.ToString(v.VInteger);
 			vtBoolean: result := IfThen(v.VBoolean, 'да', 'нет');
 			vtChar:    result := v.VChar;
-			vtExtended: str(v.VExtended^, result);
+			vtExtended: result := im.ToString(v.VExtended^);
 			vtString:   result := v.VString^;
+			vtPChar:    result := v.VPChar;
 			vtPointer:  result := '$' + HexStr(v.VPointer);
 			vtObject:   if Assigned(v.VObject) then result := v.VObject.ToString else result := 'TObject(nil)';
 			vtClass:    if Assigned(v.VClass) then result := v.VClass.ClassName else result := 'TClass(nil)';
@@ -2462,9 +2497,8 @@ var
 {$endif}
 
 	function vec.ToString: string;
-		function ComponentToString(const x: float): string; begin str(x:0:2, result); end;
 	begin
-		result := {$define item_conv := {$ifndef first} ', ' + {$endif} ComponentToString(data[itemid])} reduce_vec;
+		result := {$define item_conv := {$ifndef first} ', ' + {$endif} im.ToString(data[itemid])} reduce_vec;
 	end;
 
 	function vec.Length: float;
@@ -2477,13 +2511,27 @@ var
 		result := {$define item_conv := sqr(data[itemid])} reduce_vec;
 	end;
 
+	function vec.Normalized: vec;
+	var
+		ilen: float;
+	begin
+		ilen := 1.0 / sqrt(SquareLength);
+		{$define iterate := result.data[itemid] := data[itemid] * ilen;} foreach_component
+	end;
+
 {$if veclen = 4}
 	function vec.xyz: pair3; begin result.data[0] := data[0]; result.data[1] := data[1]; result.data[2] := data[2]; end;
 {$endif}
 
 	operator +(const a, b: vec): vec; begin {$define iterate := result.data[itemid] := a.data[itemid] + b.data[itemid];} foreach_component end;
+	operator -(const a, b: vec): vec; begin {$define iterate := result.data[itemid] := a.data[itemid] - b.data[itemid];} foreach_component end;
+	operator -(const v: vec): vec; begin {$define iterate := result.data[itemid] := -v.data[itemid];} foreach_component end;
+	operator *(const a, b: vec): vec; begin {$define iterate := result.data[itemid] := a.data[itemid] * b.data[itemid];} foreach_component end;
 	operator *(const x: float; const v: vec): vec; begin {$define iterate := result.data[itemid] := v.data[itemid] * x;} foreach_component end;
-	operator *(const v: vec; const x: float): vec; begin result := x * v; end;} all_vectors
+	operator *(const v: vec; const x: float): vec; begin result := x * v; end;
+	operator /(const a, b: vec): vec; begin {$define iterate := result.data[itemid] := a.data[itemid] / b.data[itemid];} foreach_component end;
+	operator /(const a: vec; const x: float): vec; begin {$define iterate := result.data[itemid] := a.data[itemid] / x;} foreach_component end;
+	operator /(const x: float; const b: vec): vec; begin {$define iterate := result.data[itemid] := x / b.data[itemid];} foreach_component end;} all_vectors
 
 	class constructor Session.Init;
 	var
@@ -2699,7 +2747,7 @@ threadvar
 			if name.Prefixed('re') then name := name.Tail(length('re') + 1);
 		end else
 			name := 'с кодом {}'.Format([ToString(ErrNo)]);
-		Die('Возникла ошибка {}.'.Format([name]) + HumanTrace(@Frame), ErrNo);
+		Die('{}.'.Format([name]) + HumanTrace(@Frame), ErrNo);
 	end;
 
 {$ifdef assert}
@@ -2729,6 +2777,11 @@ threadvar
 			// но TerminateProcess(GetCurrentProcess) — не очень документированный синхронный частный случай: https://stackoverflow.com/a/40499062.
 			TerminateProcess(GetCurrentProcess, exitcode);
 		end;
+	end;
+
+	class procedure Session.Impossible(const what: string);
+	begin
+		Die('Внутренняя ошибка: {}.'.Format([what]));
 	end;
 
 	class procedure Session.TestHacks;
@@ -3069,21 +3122,30 @@ type
 	p3x8 = ^_3x8; _3x8 = array[0 .. 2] of uint8;
 	p4x8 = ^_4x8; _4x8 = array[0 .. 3] of uint8;
 
+	ImageSpec = object
+		w, h, frames: SizeUint;
+		format: ImageFormat;
+		class function Make(w, h, frames: SizeUint; format: ImageFormat): ImageSpec; static;
+	end;
+
 	pImage = ^Image;
 	Image = object
 		data: pointer;
-		w, h, frames: uint;
-		format: ImageFormat;
+		spec: ImageSpec;
 		own: pointer;
 		procedure Invalidate;
-		procedure Init(const name: string; data: pointer; w, h, frames: uint; format: ImageFormat; own: pointer = nil);
+		procedure Init(const name: string; data: pointer; const spec: ImageSpec; own: pointer = nil);
 		procedure Done;
-		class procedure ValidateSize(w, h, frames: uint; format: ImageFormat; const name: string); static;
+		class procedure ValidateSize(const spec: ImageSpec; const name: string); static;
 		class procedure ValidateFrame(index, count: uint; const name: string); static;
-		class function AllocateData(w, h, frames: uint; format: ImageFormat; const name: string): pointer; static;
+		class function AllocateData(const spec: ImageSpec; const name: string): pointer; static;
 		function PixelPtr(x, y, f: SizeUint): pointer;
 		procedure DecodePixelNumber(pixel: SizeUint; out x, y, f: SizeUint; out ofs: pointer);
 		procedure NextPixel(var pixel: SizeUint; var x, y, f: SizeUint);
+		property w: SizeUint read spec.w;
+		property h: SizeUint read spec.h;
+		property frames: SizeUint read spec.frames;
+		property format: ImageFormat read spec.format;
 
 		class function ApplyGamma(const linear: float): float; static;
 		class function UnapplyGamma(const rgbcomponent: float): float; static;
@@ -3097,12 +3159,13 @@ type
 		class procedure WriteRGB(ofs: pointer; format: ImageFormat; const px: Vec3); static;
 		class procedure WriteRGBA(ofs: pointer; format: ImageFormat; const px: Vec4); static;
 		class procedure WriteLinearRGBA(ofs: pointer; format: ImageFormat; const px: Vec4); static;
-		class function RGB8ToLinearGray(ofs: pointer): float; static;
-		class function LinearRGBToGray(const r, g, b: float): float; static;
+		class function RGB8ToGray(ofs: pointer): float; static;
+		class function RGBToGray(const r, g, b: float): float; static;
+		class function LinearRGBToLinearGray(const r, g, b: float): float; static;
 		class function Denorm8(const value: float): uint8; static;
 
-		class function SizeToString(w, h, f: SizeUint): string; static;
-		class function SizeToString(w, h, f: SizeUint; format: ImageFormat): string; static;
+		class function SizeToString(const spec: ImageSpec): string; static;
+		class function SpecToString(const spec: ImageSpec): string; static;
 
 	const
 		MaxDataSize = {$if defined(CPU32)} High(SizeUint) {$elseif defined(CPU64)} High(SizeUint) shr 16 {$else} {$error platform?} {$endif} div 8;
@@ -3117,28 +3180,33 @@ type
 	function ImageFormatHelper.pixelSize: size_t; begin result := Info[self].pixelSize; end;
 	function ImageFormatHelper.id: string; begin result := Info[self].id; end;
 
+	class function ImageSpec.Make(w, h, frames: SizeUint; format: ImageFormat): ImageSpec;
+	begin
+		result.w := w;
+		result.h := h;
+		result.frames := frames;
+		result.format := format;
+	end;
+
 	procedure Image.Invalidate;
 	begin
 		data := nil;
 	end;
 
-	procedure Image.Init(const name: string; data: pointer; w, h, frames: uint; format: ImageFormat; own: pointer = nil);
+	procedure Image.Init(const name: string; data: pointer; const spec: ImageSpec; own: pointer = nil);
 	var
 		allocate: boolean;
 	begin
 		allocate := not Assigned(data);
 		try
-			ValidateSize(w, h, frames, format, name);
+			ValidateSize(spec, name);
 			if allocate then
 			begin
-				own := AllocateData(w, h, frames, format, name);
+				own := AllocateData(spec, name);
 				data := own;
 			end;
 			self.data := data;
-			self.w := w;
-			self.h := h;
-			self.frames := frames;
-			self.format := format;
+			self.spec := spec;
 			self.own := own; {$ifdef Debug} if not Assigned(own) then self.own := GetMem(1); {$endif}
 		except
 			if allocate then FreeMem(own);
@@ -3156,14 +3224,14 @@ type
 		end;
 	end;
 
-	class procedure Image.ValidateSize(w, h, frames: uint; format: ImageFormat; const name: string);
+	class procedure Image.ValidateSize(const spec: ImageSpec; const name: string);
 	begin
-		if (w = 0) or (h = 0) or (frames = 0) then raise Exception.Create('Неверный размер {}: {}.'.Format([name, SizeToString(w, h, frames)]));
-		if (w > MaxDimension) or (h > MaxDimension) or (frames > MaxFrames) or
-			(w > MaxDataSize div ImageFormatHelper.Info[format].pixelSize) or (h > MaxDataSize div ImageFormatHelper.Info[format].pixelSize div w) or
-			(frames > MaxDataSize div ImageFormatHelper.Info[format].pixelSize div w div h)
+		if (spec.w = 0) or (spec.h = 0) or (spec.frames = 0) then raise Exception.Create('Неверный размер {}: {}.'.Format([name, SizeToString(spec)]));
+		if (spec.w > MaxDimension) or (spec.h > MaxDimension) or (spec.frames > MaxFrames) or
+			(spec.w > MaxDataSize div spec.format.pixelSize) or (spec.h > MaxDataSize div (spec.format.pixelSize * spec.w)) or
+			(spec.frames > MaxDataSize div spec.format.pixelSize div (spec.w * spec.h))
 		then
-			raise Exception.Create('{}: слишком большая картинка ({}).'.Format([name, SizeToString(w, h, frames, format)]));
+			raise Exception.Create('{}: слишком большая картинка ({}).'.Format([name, SpecToString(spec)]));
 	end;
 
 	class procedure Image.ValidateFrame(index, count: uint; const name: string);
@@ -3172,10 +3240,10 @@ type
 			raise Exception.Create('Запрошен {}-й кадр {}, но там всего {}.'.Format([index, name, count]));
 	end;
 
-	class function Image.AllocateData(w, h, frames: uint; format: ImageFormat; const name: string): pointer;
+	class function Image.AllocateData(const spec: ImageSpec; const name: string): pointer;
 	begin
-		ValidateSize(w, h, frames, format, name);
-		result := GetMem(ImageFormatHelper.Info[format].pixelSize * w * h * frames);
+		ValidateSize(spec, name);
+		result := GetMem(ImageFormatHelper.Info[spec.format].pixelSize * spec.w * spec.h * spec.frames);
 	end;
 
 	function Image.PixelPtr(x, y, f: SizeUint): pointer;
@@ -3217,7 +3285,7 @@ type
 	begin
 		case format of
 			ImageFormat.G, ImageFormat.GA: result := p1x8(ofs)^[0] * Norm8;
-			ImageFormat.RGB, ImageFormat.RGBA: result := RGB8ToLinearGray(ofs);
+			ImageFormat.RGB, ImageFormat.RGBA: result := RGB8ToGray(ofs);
 			else {$ifdef Debug} raise Exception.Create('ReadG: {}'.Format([ord(format)])) {$else} result := 0 {$endif};
 		end;
 	end;
@@ -3227,8 +3295,8 @@ type
 		case format of
 			ImageFormat.G: result := Vec2.Make(p1x8(ofs)^[0] * Norm8, 1.0);
 			ImageFormat.GA: result := Vec2.Make(p2x8(ofs)^[0] * Norm8, p2x8(ofs)^[1] * Norm8);
-			ImageFormat.RGB: result := Vec2.Make(RGB8ToLinearGray(ofs), 1.0);
-			ImageFormat.RGBA: result := Vec2.Make(RGB8ToLinearGray(ofs), p4x8(ofs)^[3] * Norm8);
+			ImageFormat.RGB: result := Vec2.Make(RGB8ToGray(ofs), 1.0);
+			ImageFormat.RGBA: result := Vec2.Make(RGB8ToGray(ofs), p4x8(ofs)^[3] * Norm8);
 			else {$ifdef Debug} raise Exception.Create('ReadGA: {}'.Format([ord(format)])) {$else} result := Vec2.Make(0, 1) {$endif};
 		end;
 	end;
@@ -3289,8 +3357,8 @@ type
 	class procedure Image.WriteRGB(ofs: pointer; format: ImageFormat; const px: Vec3);
 	begin
 		case format of
-			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(LinearRGBToGray(px.data[0], px.data[1], px.data[2]));
-			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(LinearRGBToGray(px.data[0], px.data[1], px.data[2])); p2x8(ofs)^[1] := High(uint8); end;
+			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(RGBToGray(px.data[0], px.data[1], px.data[2]));
+			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(RGBToGray(px.data[0], px.data[1], px.data[2])); p2x8(ofs)^[1] := High(uint8); end;
 			ImageFormat.RGB: begin p3x8(ofs)^[0] := Denorm8(px.data[0]); p3x8(ofs)^[1] := Denorm8(px.data[1]); p3x8(ofs)^[2] := Denorm8(px.data[2]); end;
 			ImageFormat.RGBA: begin p3x8(ofs)^[0] := Denorm8(px.data[0]); p3x8(ofs)^[1] := Denorm8(px.data[1]); p3x8(ofs)^[2] := Denorm8(px.data[2]); p4x8(ofs)^[3] := High(uint8); end;
 			else {$ifdef Debug} raise Exception.Create('WriteLinearRGB: {}'.Format([ord(format)])) {$endif};
@@ -3300,8 +3368,8 @@ type
 	class procedure Image.WriteRGBA(ofs: pointer; format: ImageFormat; const px: Vec4);
 	begin
 		case format of
-			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(LinearRGBToGray(px.data[0], px.data[1], px.data[2]));
-			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(LinearRGBToGray(px.data[0], px.data[1], px.data[2])); p2x8(ofs)^[1] := Denorm8(px.data[3]); end;
+			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(RGBToGray(px.data[0], px.data[1], px.data[2]));
+			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(RGBToGray(px.data[0], px.data[1], px.data[2])); p2x8(ofs)^[1] := Denorm8(px.data[3]); end;
 			ImageFormat.RGB: begin p3x8(ofs)^[0] := Denorm8(px.data[0]); p3x8(ofs)^[1] := Denorm8(px.data[1]); p3x8(ofs)^[2] := Denorm8(px.data[2]); end;
 			ImageFormat.RGBA: begin p4x8(ofs)^[0] := Denorm8(px.data[0]); p4x8(ofs)^[1] := Denorm8(px.data[1]); p4x8(ofs)^[2] := Denorm8(px.data[2]); p4x8(ofs)^[3] := Denorm8(px.data[3]); end;
 			else {$ifdef Debug} raise Exception.Create('WriteLinearRGBA: {}'.Format([ord(format)])) {$endif};
@@ -3311,20 +3379,25 @@ type
 	class procedure Image.WriteLinearRGBA(ofs: pointer; format: ImageFormat; const px: Vec4);
 	begin
 		case format of
-			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(ApplyGamma(LinearRGBToGray(px.data[0], px.data[1], px.data[2])));
-			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(ApplyGamma(LinearRGBToGray(px.data[0], px.data[1], px.data[2]))); p2x8(ofs)^[1] := Denorm8(px.data[3]); end;
+			ImageFormat.G: p1x8(ofs)^[0] := Denorm8(ApplyGamma(LinearRGBToLinearGray(px.data[0], px.data[1], px.data[2])));
+			ImageFormat.GA: begin p2x8(ofs)^[0] := Denorm8(ApplyGamma(LinearRGBToLinearGray(px.data[0], px.data[1], px.data[2]))); p2x8(ofs)^[1] := Denorm8(px.data[3]); end;
 			ImageFormat.RGB: begin p3x8(ofs)^[0] := Denorm8(ApplyGamma(px.data[0])); p3x8(ofs)^[1] := Denorm8(ApplyGamma(px.data[1])); p3x8(ofs)^[2] := Denorm8(ApplyGamma(px.data[2])); end;
 			ImageFormat.RGBA: begin p4x8(ofs)^[0] := Denorm8(ApplyGamma(px.data[0])); p4x8(ofs)^[1] := Denorm8(ApplyGamma(px.data[1])); p4x8(ofs)^[2] := Denorm8(ApplyGamma(px.data[2])); p4x8(ofs)^[3] := Denorm8(px.data[3]); end;
 			else {$ifdef Debug} raise Exception.Create('WriteLinearRGBA: {}'.Format([ord(format)])) {$endif};
 		end;
 	end;
 
-	class function Image.RGB8ToLinearGray(ofs: pointer): float;
+	class function Image.RGB8ToGray(ofs: pointer): float;
 	begin
-		result := (RToGrayK * UnapplyGamma(p3x8(ofs)^[0] * Norm8) + GToGrayK * UnapplyGamma(p3x8(ofs)^[1] * Norm8) + BToGrayK * UnapplyGamma(p3x8(ofs)^[2] * Norm8));
+		result := RGBToGray(p3x8(ofs)^[0] * Norm8, p3x8(ofs)^[1] * Norm8, p3x8(ofs)^[2] * Norm8);
 	end;
 
-	class function Image.LinearRGBToGray(const r, g, b: float): float;
+	class function Image.RGBToGray(const r, g, b: float): float;
+	begin
+		result := ApplyGamma(LinearRGBToLinearGray(UnapplyGamma(clamp(r, 0, 1)), UnapplyGamma(clamp(g, 0, 1)), UnapplyGamma(clamp(b, 0, 1))));
+	end;
+
+	class function Image.LinearRGBToLinearGray(const r, g, b: float): float;
 	begin
 		result := RToGrayK * r + GToGrayK * g + BToGrayK * b;
 	end;
@@ -3334,14 +3407,14 @@ type
 		result := round(clamp(value * High(result), 0, High(result)));
 	end;
 
-	class function Image.SizeToString(w, h, f: SizeUint): string;
+	class function Image.SizeToString(const spec: ImageSpec): string;
 	begin
-		result := ('{}x{}' + IfThen(f <> 1, 'x{}')).Format([VarRec.uint(w), VarRec.uint(h), VarRec.uint(f)]);
+		result := ('{}x{}' + IfThen(spec.frames <> 1, 'x{}')).Format([VarRec.uint(spec.w), VarRec.uint(spec.h), VarRec.uint(spec.frames)]);
 	end;
 
-	class function Image.SizeToString(w, h, f: SizeUint; format: ImageFormat): string;
+	class function Image.SpecToString(const spec: ImageSpec): string;
 	begin
-		result := ('{}' + IfThen(format <> ImageFormat.RGB, '{}')).Format([SizeToString(w, h, f), format.id]);
+		result := ('{}' + IfThen(spec.format <> ImageFormat.RGB, '{}')).Format([SizeToString(spec), ImageFormatHelper.Info[spec.format].id]);
 	end;
 
 type
@@ -3351,46 +3424,66 @@ type
 		mode: ModeEnum;
 		name, orig: string;
 		frame, insertFrameNoAt: SizeInt;
-		class function Parse(const data: string): ImageName; static;
+		class function Parse(const data: string; forceMode: sint = -1): ImageName; static;
+		class function &File(const fn: string): ImageName; static;
 	end;
 
-	class function ImageName.Parse(const data: string): ImageName;
+	class function ImageName.Parse(const data: string; forceMode: sint = -1): ImageName;
 	var
-		i, np: SizeInt;
+		i, np, len: SizeInt;
 		canBeAlias: boolean;
 		nn: string absolute result.name;
 	begin
-		canBeAlias := true;
 		result.frame := -1;
 		result.insertFrameNoAt := 0;
 		i := 1;
 		nn := data;
 		result.orig := data;
-		while i <= length(nn) do
-			case nn[i] of
-				'\', '/': begin canBeAlias := false; inc(i); end;
-				'.': begin canBeAlias := false; inc(i); end;
-				'%':
-					if (result.insertFrameNoAt = 0) and nn.Prefixed('f%', i + 1) then
-					begin
-						result.insertFrameNoAt := i;
-						delete(nn, i, length('%f%'));
-					end else
-					begin
-						canBeAlias := false;
-						inc(i);
-					end;
-				':':
-					if nn.Consume(['0' .. '9'], i + 1, np) and (np > length(nn)) and TryParse(nn.AB(i + 1, np), result.frame) then
-					else
-					begin
-						canBeAlias := false;
-						inc(i);
-					end;
-				else inc(i);
-			end;
+		if (forceMode >= 0) and (forceMode <= ord(High(ModeEnum))) then
+			result.mode := ModeEnum(forceMode)
+		else
+		begin
+			canBeAlias := true;
+			while i <= length(nn) do
+				case nn[i] of
+					'\', '/': begin canBeAlias := false; inc(i); end;
+					'.': begin canBeAlias := false; inc(i); end;
+					'%':
+						begin
+							if result.insertFrameNoAt = 0 then
+							begin
+								if nn.Prefixed('f%', i + 1) then len := length('%f%')
+								else if nn.Prefixed('frame%', i + 1) then len := length('%frame')
+								else len := 0;
 
-		if canBeAlias then result.mode := Alias else result.mode := Filename;
+								if len > 0 then
+								begin
+									result.insertFrameNoAt := i;
+									delete(nn, i, len);
+									continue;
+								end;
+							end;
+
+							canBeAlias := false;
+							inc(i);
+						end;
+					':':
+						if nn.Consume(['0' .. '9'], i + 1, np) and (np > length(nn)) and TryParse(nn.AB(i + 1, np), result.frame) then
+						else
+						begin
+							canBeAlias := false;
+							inc(i);
+						end;
+					else inc(i);
+				end;
+
+			if canBeAlias then result.mode := Alias else result.mode := Filename;
+		end;
+	end;
+
+	class function ImageName.&File(const fn: string): ImageName;
+	begin
+		result := Parse(fn, ord(Filename));
 	end;
 
 type
@@ -3531,7 +3624,7 @@ type
 	pGenericOpPayload = ^GenericOpPayload;
 	GenericOpPayload = class(TObjectEx)
 		op: GenericOp;
-		im: Image;
+		oim: Image;
 		destructor Destroy; override;
 		procedure Start; virtual;
 		procedure GeneratePart(threadIndex, startPixel, endPixel: SizeUint); virtual;
@@ -3602,11 +3695,11 @@ type
 
 		constructor Create(var ir: ImageRegistry; pl: pGenericOpPayload);
 		destructor Destroy; override;
-		function AddInput(const name: ImageName; onlyRead: boolean): SizeInt;
+		function AddInput(const name: ImageName; onlyRead: boolean = false): SizeInt;
 		procedure Run;
 		procedure Cancel(lock: boolean);
 		procedure FailFromExcept;
-		procedure Intercept;
+		procedure Intercept(lock: boolean = true);
 		procedure Wait;
 		function Progress: float;
 		procedure NoteProgress(threadIndex: SizeUint; const progress: float); // Должна вызываться из GenericOpPayload.GeneratePart.
@@ -3647,7 +3740,7 @@ type
 
 	destructor GenericOpPayload.Destroy;
 	begin
-		im.Done;
+		oim.Done;
 		inherited Destroy;
 	end;
 
@@ -3705,7 +3798,7 @@ type
 		inherited Destroy;
 	end;
 
-	function GenericOp.AddInput(const name: ImageName; onlyRead: boolean): SizeInt;
+	function GenericOp.AddInput(const name: ImageName; onlyRead: boolean = false): SizeInt;
 	begin
 		lock.Enter;
 		try
@@ -3756,7 +3849,7 @@ type
 								lock.Leave;
 							end;
 						end;
-					else raise LogicError.Create('mode = {}'.Format([ord(inputs[i].name.mode)]));
+					else Session.Impossible('mode = {}'.Format([ord(inputs[i].name.mode)]));
 				end;
 
 			MaybeProceedToPayload(true);
@@ -3797,13 +3890,13 @@ type
 		end;
 	end;
 
-	procedure GenericOp.Intercept;
+	procedure GenericOp.Intercept(lock: boolean = true);
 	begin
-		lock.Enter;
+		if lock then self.lock.Enter else Assert(self.lock.AcquiredAssert);
 		try
 			if stat <> Status.Running then raise Interception.Create('Операция прервана.');
 		finally
-			lock.Leave;
+			if lock then self.lock.Leave;
 		end;
 	end;
 
@@ -3811,13 +3904,18 @@ type
 	begin
 		lock.Enter;
 		try
-			while running > 0 do hey.Wait(lock);
+			while (stat = Status.Running) or (running > 0) do hey.Wait(lock);
 		finally
 			lock.Leave;
 		end;
 	end;
 
 	function GenericOp.Progress: float;
+		function OnceRead: float;
+		begin
+			if Ary(fileInputs).Empty then result := 0 else result := 0.1;
+		end;
+
 		function SingleReadingProgress(const inp: InputRec): float;
 		const
 			WhenReading = 0.05;
@@ -3862,7 +3960,8 @@ type
 		begin
 			case outp.stage of
 				OutputStage.QueuedForEncoding: result := WhenQueued;
-				OutputStage.Encoding: result := WhenQueued + (WhenWriting - WhenQueued) * InfiniteProgressBar(Ticks.Get - outp.startedAt, 2.0);
+				// Для оценки в идеале можно было бы выбрать N пикселей оригинальной картинки, попробовать их закодировать, засечь время и экстраполировать.
+				OutputStage.Encoding: result := WhenQueued + (WhenWriting - WhenQueued) * InfiniteProgressBar(Ticks.Get - outp.startedAt, 1.0 * (1 + sqr(ord(lodePreset))));
 				OutputStage.Writing: result := WhenWriting + (1.0 - WhenWriting) * InfiniteProgressBar(Ticks.Get - outp.startedAt, 1.0);
 				OutputStage.Completed: result := 1.0;
 				else result := 0;
@@ -3878,8 +3977,6 @@ type
 			result /= length(fileOutputs);
 		end;
 
-	const
-		OnceRead = 0.1;
 	begin
 		Assert(lock.AcquiredAssert);
 		case stage of
@@ -3906,7 +4003,7 @@ type
 
 	function GenericOp.CodingThreads: SizeUint;
 	begin
-		result := 2 * CPUCount;
+		result := CPUCount;
 	end;
 
 	procedure GenericOp.Abort;
@@ -3950,7 +4047,7 @@ type
 	begin
 		for i := 0 to High(inputs) do
 		begin
-			// task изредкадедлокается, мне лень разбираться, поэтому очищается в деструкторе отдельно
+			// task изредка дедлокается, мне лень разбираться, поэтому очищается в деструкторе отдельно
 			inputs[i].im^.Release(inputs[i].im);
 			inputs[i].f.Close;
 			FreeMem(inputs[i].data);
@@ -4190,7 +4287,7 @@ type
 
 		try
 			inp.im := ImageRegistry.Item.Create;
-			inp.im^.im.Init(inp.name.name, decodedData, w, h, 1, fmt, decodedBlock);
+			inp.im^.im.Init(inp.name.name, decodedData, ImageSpec.Make(w, h, 1, fmt), decodedBlock);
 		except
 			FreeMem(decodedBlock);
 			raise;
@@ -4213,19 +4310,25 @@ type
 	end;
 
 	procedure GenericOp.StartProcessing;
-	const
-		MinPixelsForThread = 4096;
 	var
 		partSize, pixels: SizeUint;
 		i: SizeInt;
 	begin
 		Assert(lock.AcquiredAssert);
-		pl.Start;
-		if Assigned(pl.im.data) then
+		lock.Leave;
+		try
+			pl.Start;
+		finally
+			lock.Enter;
+		end;
+		Intercept(false);
+		if Assigned(pl.oim.data) then
 		begin
-			pixels := SizeUint(pl.im.w) * pl.im.h * pl.im.frames;
-			partSize := RoundUp(max(MinPixelsForThread, pixels div CodingThreads), PageSize);
-			SetLength(threads, (pixels + (partSize - 1)) div partSize);
+			pixels := SizeUint(pl.oim.w) * pl.oim.h * pl.oim.frames;
+			partSize := pixels div CodingThreads;
+			partSize := partSize - partSize mod PageSize;
+			partSize := max(partSize, PageSize);
+			SetLength(threads, max(1, pixels div partSize));
 			for i := 0 to High(threads) do
 			begin
 				new(threads[i].param);
@@ -4292,35 +4395,35 @@ type
 			fo: pOutputRec;
 		begin
 			name := oname.name;
-			if (frame < 0) and (pl.im.frames > 1) then
+			if (frame < 0) and (pl.oim.frames > 1) then
 				case oname.mode of
 					ImageName.Alias:
 						begin
 							im := ImageRegistry.Item.Create;
 							try
-								im^.im := pl.im; pl.im.Invalidate;
+								im^.im := pl.oim; pl.oim.Invalidate;
 								ir^.Add(im, name);
 							finally
 								im^.Release(im);
 							end;
 						end;
-					else raise Exception.Create('Нельзя вывести {} кадр{/а/ов} в {}. Используйте псевдоним или %f%.'.Format([pl.im.frames, name]));
+					else raise Exception.Create('Нельзя вывести {} кадр{/а/ов} в {}. Используйте псевдоним или %f%.'.Format([pl.oim.frames, name]));
 				end
 			else
 			begin
 				if frame < 0 then frame := 0;
-				Image.ValidateFrame(frame, pl.im.frames, name);
+				Image.ValidateFrame(frame, pl.oim.frames, name);
 
 				if oname.insertFrameNoAt > 0 then
 					name := name.Stuffed(oname.insertFrameNoAt, 0, '{}'.Format([frame]))
-				else if pl.im.frames > 1 then raise Exception.Create('{} содержит {} кадр{/а/ов}, используйте %f%.'.Format([name, pl.im.frames]));
+				else if pl.oim.frames > 1 then raise Exception.Create('{} содержит {} кадр{/а/ов}, используйте %f%.'.Format([name, pl.oim.frames]));
 
 				case oname.mode of
 					ImageName.Alias:
 						begin
 							im := ImageRegistry.Item.Create;
 							try
-								im^.im.Init(name, nil, pl.im.w, pl.im.h, 1, pl.im.format);
+								im^.im.Init(name, nil, ImageSpec.Make(pl.oim.w, pl.oim.h, 1, pl.oim.format));
 								ir^.Add(im, name);
 							finally
 								im^.Release(im);
@@ -4349,11 +4452,11 @@ type
 	begin
 		Assert(lock.AcquiredAssert);
 		Assert(stage = GlobalStage.Saving);
-		if not Assigned(pl.im.data) then exit;
+		if not Assigned(pl.oim.data) then exit;
 
 		if oname.name = '' then raise Exception.Create('Не задан выходной файл.');
 		if oname.insertFrameNoAt > 0 then
-			for i := 0 to pl.im.frames - 1 do
+			for i := 0 to pl.oim.frames - 1 do
 				SaveFrame(i)
 		else
 			SaveFrame(oname.frame);
@@ -4461,18 +4564,18 @@ type
 		encodedData, encodedBlock: pointer;
 		encodedSize: csize_t;
 	begin
-		case pl.im.format of
+		case pl.oim.format of
 			ImageFormat.G: lct := lodepng.CT_GREY;
 			ImageFormat.GA: lct := lodepng.CT_GREY_ALPHA;
 			ImageFormat.RGB: lct := lodepng.CT_RGB;
 			ImageFormat.RGBA: lct := lodepng.CT_RGBA;
-			else raise Exception.Create('Сохранение {} в PNG не поддерживается.'.Format([pl.im.format.id]));
+			else raise Exception.Create('Сохранение {} в PNG не поддерживается.'.Format([pl.oim.format.id]));
 		end;
 
 		try
 			lcode := lodepng.encode_memory(encodedData, encodedSize,
-				pl.im.data + pl.im.format.pixelSize * pl.im.w * pl.im.h * outp.frame,
-				pl.im.w, pl.im.h, lct, bitsizeof(uint8), lodepng.Presets[lodepng.Good], lodepng.GlobalAllocator);
+				pl.oim.data + pl.oim.format.pixelSize * pl.oim.w * pl.oim.h * outp.frame,
+				pl.oim.w, pl.oim.h, lct, bitsizeof(uint8), lodepng.Presets[lodepng.Good], lodepng.GlobalAllocator);
 		except
 			lodepng.island.Purge(ThreadID);
 			raise;
@@ -4536,7 +4639,7 @@ type
 		iwsum: float;
 		procedure Start; override;
 		procedure GeneratePart(threadIndex, startPixel, endPixel: SizeUint); override;
-		class procedure ChooseOutputFormat(op: GenericOp; out w, h: SizeUint; out fmt: ImageFormat); static;
+		class procedure ChooseOutputSpec(op: GenericOp; out spec: ImageSpec); static;
 	const
 		FormatEstimation: array[ImageFormat] of uint = (0, 1, 2, 3);
 		ReportPeriodPixels = 16384;
@@ -4545,8 +4648,7 @@ type
 	procedure MixOperation.Start;
 	var
 		i: SizeInt;
-		rfmt: ImageFormat;
-		rw, rh: SizeUint;
+		rspec: ImageSpec;
 		wsum: float;
 	begin
 		if length(op.inputs) <= 1 then
@@ -4563,13 +4665,15 @@ type
 		for i := 1 to High(inps) do wsum += inps[i].weight;
 		for i := 0 to High(inps) do inps[i].weight /= wsum;
 
-		ChooseOutputFormat(op, rw, rh, rfmt);
-		im.Init(op.oname.name, nil, rw, rh, 1, rfmt);
+		ChooseOutputSpec(op, rspec);
+		oim.Init(op.oname.name, nil, rspec);
 	end;
 
-	class procedure MixOperation.ChooseOutputFormat(op: GenericOp; out w, h: SizeUint; out fmt: ImageFormat);
+	class procedure MixOperation.ChooseOutputSpec(op: GenericOp; out spec: ImageSpec);
 	var
 		refim, nim: pImage;
+		fmt: ImageFormat;
+		w, h: SizeUint;
 		i: SizeInt;
 	begin
 		if length(op.inputs) = 0 then raise Exception.Create('Нет входных файлов.');
@@ -4585,11 +4689,12 @@ type
 		end;
 		w := refim^.w;
 		h := refim^.h;
+		spec := ImageSpec.Make(w, h, 1, fmt);
 	end;
 
 	procedure MixOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
 	var
-		pixel, x, y, f: SizeUint;
+		pixel, x, y, f, opsz: SizeUint;
 		ofs: pointer;
 		linps: array of record
 			ofs: pointer;
@@ -4599,8 +4704,9 @@ type
 		i: SizeInt;
 		sum: Vec4;
 	begin
-		im.DecodePixelNumber(startPixel, x, y, f, ofs);
+		oim.DecodePixelNumber(startPixel, x, y, f, ofs);
 		pixel := startPixel;
+		opsz := oim.format.pixelSize;
 		SetLength(linps, length(inps));
 		for i := 0 to High(linps) do
 		begin
@@ -4614,9 +4720,9 @@ type
 			sum := inps[0].weight * Image.ReadLinearRGBA(linps[0].ofs, linps[0].fmt);
 			for i := 1 to High(inps) do
 				sum += inps[i].weight * Image.ReadLinearRGBA(linps[i].ofs, linps[i].fmt);
-			Image.WriteLinearRGBA(ofs, im.format, sum);
+			Image.WriteLinearRGBA(ofs, oim.format, sum);
 			inc(pixel);
-			ofs += im.format.pixelSize;
+			ofs += opsz;
 			for i := 0 to High(linps) do linps[i].ofs += linps[i].pixelSize;
 			if pixel mod ReportPeriodPixels = 0 then op.NoteProgress(threadIndex, (pixel - startPixel) / (endPixel - startPixel));
 		end;
@@ -4635,18 +4741,18 @@ type
 
 	procedure TweenOperation.Start;
 	var
-		rfmt: ImageFormat;
-		rw, rh, frames: SizeUint;
+		spec: ImageSpec;
+		frames: SizeUint;
 		i: SizeInt;
 	begin
 		if length(op.inputs) <= 1 then
 			raise Exception.Create('Недостаточно входных файлов для смешивания ({}).'.Format([length(op.inputs)]));
 		if length(inps) + 1 <> length(op.inputs) then
 			raise Exception.Create('Неверно заданы переходы: ожидается {}-1, получено {}.'.Format([length(op.inputs), length(inps)]));
-		MixOperation.ChooseOutputFormat(op, rw, rh, rfmt);
+		MixOperation.ChooseOutputSpec(op, spec);
 		frames := 1;
 		for i := 0 to High(inps) do frames += 1 + inps[i].extraFrames;
-		im.Init(op.oname.name, nil, rw, rh, frames, rfmt);
+		oim.Init(op.oname.name, nil, ImageSpec.Make(spec.w, spec.h, frames, spec.format));
 	end;
 
 	procedure TweenOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
@@ -4666,15 +4772,15 @@ type
 			end;
 		end;
 	begin
-		im.DecodePixelNumber(startPixel, x, y, f, outOfs);
-		im.DecodePixelNumber(endPixel, endX, endY, endF, endOfs);
+		oim.DecodePixelNumber(startPixel, x, y, f, outOfs);
+		oim.DecodePixelNumber(endPixel, endX, endY, endF, endOfs);
 		curA := 0; curAFrame := 0;
 		for iframe := 1 to f do NextA;
 
 		pixel := startPixel;
 		while pixel < endPixel do
 		begin
-			batchPixels := im.w * im.h;
+			batchPixels := oim.w * oim.h;
 			if pixel = startPixel then
 			begin
 				batchPixels -= pixel mod batchPixels; // первая картинка может начаться с середины
@@ -4691,13 +4797,13 @@ type
 			progressK := batchPixels / (endPixel - startPixel);
 
 			if curAFrame = 0 then
-				Blit(batchPixels, aOfs, op.inputs[curA].im^.im.format, outOfs, im.format, self, threadIndex, progressBase, progressK)
+				Blit(batchPixels, aOfs, op.inputs[curA].im^.im.format, outOfs, oim.format, self, threadIndex, progressBase, progressK)
 			else
-				Tween(batchPixels, aOfs, op.inputs[curA].im^.im.format, bOfs, op.inputs[curA + 1].im^.im.format, outOfs, im.format, curAFrame / (1 + inps[curA].extraFrames),
+				Tween(batchPixels, aOfs, op.inputs[curA].im^.im.format, bOfs, op.inputs[curA + 1].im^.im.format, outOfs, oim.format, curAFrame / (1 + inps[curA].extraFrames),
 					self, threadIndex, progressBase, progressK);
 
 			pixel += batchPixels;
-			outOfs += batchPixels * im.format.pixelSize;
+			outOfs += batchPixels * oim.format.pixelSize;
 			NextA;
 		end;
 	end;
@@ -4797,6 +4903,19 @@ type
 
 type
 	lua = object
+	const
+		OK = 0; YIELDED = 1; ERRRUN = 2; ERRSYNTAX = 3; ERRMEM = 4; ERRGCMM = 5; ERRERR = 6;
+
+		MULTRET = -1;
+		FIRSTPSEUDOIDX = -1001000;
+		REGISTRYINDEX = FIRSTPSEUDOIDX;
+		RIDX_MAINTHREAD = 1; RIDX_GLOBALS = 2; RIDX_LAST = RIDX_GLOBALS;
+
+		TNONE = -1; TNIL = 0; TBOOLEAN = 1; TLIGHTUSERDATA = 2; TNUMBER = 3; TSTRING = 4; TTABLE = 5; TFUNCTION = 6; TUSERDATA = 7; TTHREAD = 8;
+		MASKCALL = 1 shl 0; MASKRET = 1 shl 1; MASKLINE = 1 shl 2; MASKCOUNT = 1 shl 3; MASKTAILCALL = 1 shl 4;
+
+		IDSIZE = 60;
+
 	type
 		State = ^State_; State_ = record end;
 		Number = type double; pNumber = ^Number;
@@ -4808,44 +4927,36 @@ type
 		ChunkWriter = function(L: State; p: pointer; sz: csize_t; ud: pointer): cint; cdecl;
 		Alloc = function(ud: pointer; ptr: pointer; osize, nsize: csize_t): pointer; cdecl;
 
+		Debug = record
+			event: cint;
+			name: PChar; // (n)
+			namewhat: PChar; // (n) 'global', 'local', 'field', 'method'
+			what: PChar; // (S) 'Lua', 'C', 'main', 'tail'
+			source: PChar; // (S)
+			currentline: cint; // (l)
+			linedefined: cint; // (S)
+			lastlinedefined: cint; // (S)
+			nups: cuchar; // (u) number of upvalues
+			nparams: cuchar; // (u) number of parameters
+			isvararg: cschar; // (u)
+			istailcall: cuchar; // (t)
+			short_src: array[0 .. IDSIZE-1] of ansichar; // (S)
+			&private: pointer;
+		end;
+		Hook = procedure(L: State; var ar: Debug); cdecl;
+
 		// модификации: пользовательские функции для error и pcall
-		Throw = procedure; cdecl;
+		Throwf = procedure; cdecl;
 		PFunc = procedure(L: State; ud: pointer); cdecl;
 		PCallf = function(f: PFunc; L: State; ud: pointer): cint; cdecl;
-
-	const
-		OK        = 0;
-		YIELDED   = 1;
-		ERRRUN    = 2;
-		ERRSYNTAX = 3;
-		ERRMEM    = 4;
-		ERRGCMM   = 5;
-		ERRERR    = 6;
-
-		MULTRET = -1;
-		FIRSTPSEUDOIDX = -1001000;
-		REGISTRYINDEX = FIRSTPSEUDOIDX;
-
-		RIDX_MAINTHREAD = 1;
-		RIDX_GLOBALS = 2; RIDX_LAST = RIDX_GLOBALS;
-
-		TNONE = -1;
-		TNIL = 0;
-		TBOOLEAN = 1;
-		TLIGHTUSERDATA = 2;
-		TNUMBER = 3;
-		TSTRING = 4;
-		TTABLE = 5;
-		TFUNCTION = 6;
-		TUSERDATA = 7;
-		TTHREAD = 8;
 
 	class var
 		lib: DLL;
 		newstate: function(f: Alloc; ud: pointer): State; cdecl;
 		close: procedure(L: State); cdecl;
 		atpanic: function(L: State; panicf: CFunction): CFunction; cdecl;
-		onthrow: procedure(L: State; throwf: Throw; pcallf: PCallf); cdecl;
+		onthrow: procedure(L: State; throwf: Throwf; pcallf: PCallf); cdecl;
+		sethook: function(L: State; func: Hook; mask, count: cint): cint; cdecl;
 
 		gettop: function(L: State): cint; cdecl;
 		settop: procedure(L: State; idx: cint); cdecl;
@@ -4881,14 +4992,12 @@ type
 		getfield: procedure(l: State; index: cint; k: pChar); cdecl;
 		rawget: procedure(L: State; idx: cint); cdecl;
 		rawgeti: procedure(L: State; idx, n: cint); cdecl;
-		rawgetp: procedure(L: State; idxn: cint; p: pointer); cdecl;
 		getmetatable: function(L: State; objindex: cint): cint; cdecl;
 		getuservalue: procedure(L: State; index: cint); cdecl;
 
 		setfield: procedure(l: State; index: cint; k: pChar); cdecl;
 		rawset: procedure(L: State; idx: cint); cdecl;
 		rawseti: procedure(L: State; idx, n: cint); cdecl;
-		rawsetp: procedure(L: State; idx: cint; p: pointer); cdecl;
 		setmetatable: function(L: State; objindex: cint): LongBool; cdecl;
 		setuservalue: procedure(L: State; index: cint); cdecl;
 		setupvalue: function(L: State; funcindex, n: cint): PChar; cdecl;
@@ -4920,15 +5029,19 @@ type
 
 		class procedure call(L: State; nargs, nresults: cint); static;
 		class function pcall(L: State; nargs, nresults, errfunc: cint): cint; static;
-		class function userparam(L: State): pPointer; static;
+		class function userparamptr(L: State): pPointer; static;
 
 		class procedure pushstring(L: State; const s: string); static;
-		class function loadstring(L: State; const parts: array of string; const name: string; errmsg: pString): boolean; static;
+		class procedure pushcfunction(L: State; f: CFunction); static;
+		class procedure loadstringE(L: State; const parts: array of string; const name: string); static;
+		class function striplinenumber(const msg, chunkName: string): string; static;
+		class procedure throw(L: State; const msg: string); noreturn; static;
 
-		class function default_allocf(ud: pointer; ptr: pointer; osize, nsize: csize_t): pointer; cdecl;
-		class procedure default_throwf; cdecl;
-		class function default_pcallf(f: PFunc; L: State; ud: pointer): cint; cdecl;
-		class function default_panic(L: State): cint; cdecl;
+		class function default_alloc(ud: pointer; ptr: pointer; osize, nsize: csize_t): pointer; cdecl; static;
+		class procedure default_throw; cdecl; static;
+		class function default_pcall(f: PFunc; L: State; ud: pointer): cint; cdecl; static;
+		class function default_panic(L: State): cint; cdecl; static;
+		class function adjustidx(index, pushed: cint): cint; static;
 
 	strict private type
 		InternalThrow = class end;
@@ -4937,13 +5050,13 @@ type
 			parts: pString;
 			next, total: SizeInt;
 		end;
-		class function loadstring_reader(L: lua.State; ud: pointer; out sz: csize_t): pChar; cdecl;
+		class function loadstring_reader(L: lua.State; ud: pointer; out sz: csize_t): pChar; cdecl; static;
 	end;
 
 	class procedure lua.Load(const fn: string);
 	begin
 		try
-			lib.Load(fn).Prefix('lua_').Func('newstate', newstate).Func('close', close).Func('atpanic', atpanic).Func('onthrow', onthrow)
+			lib.Load(fn).Prefix('lua_').Func('newstate', newstate).Func('close', close).Func('atpanic', atpanic).Func('onthrow', onthrow).Func('sethook', sethook)
 				.Func('gettop', gettop).Func('settop', settop).Func('pushvalue', pushvalue).Func('rotate', rotate).Func('copy', copy).Func('absindex', absindex)
 				.Func('isnumber', isnumber).Func('isinteger', isinteger).Func('isuserdata', isuserdata).Func('iscfunction', iscfunction)
 				.Func('type', &type).Func('typename', typename)
@@ -4951,8 +5064,8 @@ type
 				.Func('rawlen', rawlen).Func('rawequal', rawequal)
 				.Func('pushnil', pushnil).Func('pushnumber', pushnumber).Func('pushinteger', pushinteger).Func('pushlstring', pushlstring).Func('pushcclosure', pushcclosure)
 				.Func('pushboolean', pushboolean).Func('pushlightuserdata', pushlightuserdata).Func('createtable', createtable).Func('newuserdata', newuserdata)
-				.Func('getfield', getfield).Func('rawget', rawget).Func('rawgeti', rawgeti).Func('rawgetp', rawgetp).Func('getmetatable', getmetatable).Func('getuservalue', getuservalue)
-				.Func('setfield', setfield).Func('rawset', rawset).Func('rawseti', rawseti).Func('rawsetp', rawsetp).Func('setmetatable', setmetatable).Func('setuservalue', setuservalue).Func('setupvalue', setupvalue)
+				.Func('getfield', getfield).Func('rawget', rawget).Func('rawgeti', rawgeti).Func('getmetatable', getmetatable).Func('getuservalue', getuservalue)
+				.Func('setfield', setfield).Func('rawset', rawset).Func('rawseti', rawseti).Func('setmetatable', setmetatable).Func('setuservalue', setuservalue).Func('setupvalue', setupvalue)
 				.Func('callk', callk).Func('pcallk', pcallk).Func('error', error)
 				.Func('load', load_);
 		except
@@ -5031,7 +5144,7 @@ type
 		result := pcallk(L, nargs, nresults, errfunc, 0, nil);
 	end;
 
-	class function lua.userparam(L: State): pPointer;
+	class function lua.userparamptr(L: State): pPointer;
 	begin
 		result := pPointer(L) - 1;
 	end;
@@ -5039,6 +5152,11 @@ type
 	class procedure lua.pushstring(L: State; const s: string);
 	begin
 		pushlstring(L, pChar(s), length(s));
+	end;
+
+	class procedure lua.pushcfunction(L: State; f: CFunction);
+	begin
+		pushcclosure(L, f, 0);
 	end;
 
 	class function lua.loadstring_Reader(L: lua.State; ud: pointer; out sz: csize_t): PChar; cdecl;
@@ -5059,32 +5177,62 @@ type
 		sz := 0; result := nil;
 	end;
 
-	class function lua.loadstring(L: State; const parts: array of string; const name: string; errmsg: pString): boolean;
+	class procedure lua.loadstringE(L: State; const parts: array of string; const name: string);
 	var
 		rr: loadstring_ReaderParam;
+		msg: string;
 	begin
 		rr.parts := pString(parts);
 		rr.next := 0;
 		rr.total := length(parts);
-		result := load_(L, ChunkReader(@lua.loadstring_reader), @rr, pChar('=' + name), nil) = OK;
-		if not result then
+		if load_(L, ChunkReader(@lua.loadstring_reader), @rr, pChar('=' + name), nil) <> OK then
 		begin
-			if Assigned(errmsg) then errmsg^ := tostring(L, -1);
+			msg := tostring(L, -1);
 			pop(L);
+			raise Exception.Create(msg);
 		end;
 	end;
 
-	class function lua.default_allocf(ud: pointer; ptr: pointer; osize, nsize: csize_t): pointer; cdecl;
+	class function lua.striplinenumber(const msg, chunkName: string): string;
+	var
+		p: SizeInt;
+	begin
+		if msg.Prefixed(chunkName) and msg.Consume([':'], length(chunkName) + 1, p) and msg.Consume(['0' .. '9'], p, p) and (msg.Consume([':'], p) > p) then
+		begin
+			// сейчас в GenerateByScriptOperation.ScriptState имя чанка (совпадающее с исходником) заканчивается переводом строки,
+			// чтобы сообщение об ошибке выводилось как
+			// исходник <EOL>
+			// комментарий от Lua
+
+			// так вот: если имя блока заканчивается таким переводом строки, убрать последнюю : вместе с пробелом, а то будет
+			// исходник <EOL>
+			// : комментарий от Lua          <- лишние двоеточик и пробел в начале
+			if chunkName.ConsumeRev(StringHelper.AsciiSpaces, length(chunkName)) < length(chunkName) then
+				msg.Consume([':', ' '], p, p);
+			result := msg.Head(length(chunkName)) + msg.Tail(p);
+		end else
+			result := msg;
+	end;
+
+	class procedure lua.throw(L: State; const msg: string);
+	begin
+		pushstring(L, msg);
+		error(L);
+	end;
+
+{$ifdef suppress_false_dfa_alarms} {$warn 5058 off} {$endif} // 'ptr' does not seem to be initialized
+	class function lua.default_alloc(ud: pointer; ptr: pointer; osize, nsize: csize_t): pointer; cdecl;
 	begin {$define args := ud _ osize} unused_args
 		result := ReallocMem(ptr, nsize);
 	end;
+{$ifdef suppress_false_dfa_alarms} {$warn 5058 on} {$endif}
 
-	class procedure lua.default_throwf; cdecl;
+	class procedure lua.default_throw; cdecl;
 	begin
 		raise InternalThrow.Create;
 	end;
 
-	class function lua.default_pcallf(f: PFunc; L: State; ud: pointer): cint; cdecl;
+	class function lua.default_pcall(f: PFunc; L: State; ud: pointer): cint; cdecl;
 	begin
 		try
 			f(L, ud);
@@ -5099,59 +5247,58 @@ type
 		raise Exception.Create(tostring(L, -1));
 	end;
 
-type
-	GenerateByFormulaOperation = class(GenericOpPayload)
-	type
-		GetPixelProc = procedure(x, y, f: SizeUint; out color: Vec4; var im: Image; param: pointer);
-	var
-		getPixel: GetPixelProc;
-		param: pointer;
-		w, h, frames: SizeUint;
-		format: ImageFormat;
-		procedure Start; override;
-		procedure GeneratePart(threadIndex, startPixel, endPixel: SizeUint); override;
-	end;
-
-	procedure GenerateByFormulaOperation.Start;
+	class function lua.adjustidx(index, pushed: cint): cint;
 	begin
-		im.Init(op.oname.name, nil, w, h, frames, format);
+		if (index > lua.FIRSTPSEUDOIDX) and (index < 0) then result := index - pushed else result := index;
 	end;
 
-	procedure GenerateByFormulaOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
-	var
-		x, y, f, pixel: SizeUint;
-		color: Vec4;
-		outOfs: pointer;
-	begin
-		im.DecodePixelNumber(startPixel, x, y, f, outOfs);
-		pixel := startPixel;
-		while pixel < endPixel do
-		begin
-			getPixel(x, y, f, color, im, param);
-			Image.WriteRGBA(outOfs, im.format, color);
-			im.NextPixel(pixel, x, y, f);
-			outOfs += im.format.pixelSize;
-			if pixel mod MixOperation.ReportPeriodPixels = 0 then op.NoteProgress(threadIndex, (pixel - startPixel) / (endPixel - startPixel));
-		end;
-	end;
+{$define all_script_vectors :=
+	{$if defined(vec) or defined(vecn) or defined(pvec) or defined(vecMT) or defined(vecname) or
+		defined(l_vecctr) or defined(pushvec) or defined(argvec) or defined(pushargvec)}
+		{$error all_script_vectors would hide defines}
+	{$endif}
 
-	procedure GetPixel(x, y, f: SizeUint; out color: Vec4; var im: Image; param: pointer);
-	begin {$define args := f _ param} unused_args
-		color.x := clamp(sqr(1 - abs(1 - (x/im.w + y/im.h))), 0, 1);
-		color.y := clamp(1 - sqrt(abs(x/im.w-0.5)) - sqrt(abs(y/im.h-0.5)), 0, 1);
-		color.z := clamp(1 - 4*sqr(x/im.w-0.5) - 4*sqr(y/im.h-0.5), 0, 1);
-		color.w := 1;
-	end;
+	{$define vec := Vec2} {$define vecn := 2} {$define pvec := pVec2} {$define vecMT := Reg_Vec2MT} {$define vecname := 'vec2'}
+	{$define l_vecctr := l_vec2} {$define pushvec := PushVec2} {$define argvec := ArgVec2} {$define pushargvec := PushArgVec2} vecf
+
+	{$define vec := Vec3} {$define vecn := 3} {$define pvec := pVec3} {$define vecMT := Reg_Vec3MT} {$define vecname := 'vec3'}
+	{$define l_vecctr := l_vec3} {$define pushvec := PushVec3} {$define argvec := ArgVec3} {$define pushargvec := PushArgVec3} vecf
+
+	{$define vec := Vec4} {$define vecn := 4} {$define pvec := pVec4} {$define vecMT := Reg_Vec4MT} {$define vecname := 'vec4'}
+	{$define l_vecctr := l_vec4} {$define pushvec := PushVec4} {$define argvec := ArgVec4} {$define pushargvec := PushArgVec4} vecf
+
+	{$undef vec} {$undef vecn} {$undef pvec} {$undef vecMT} {$undef vecname}
+	{$undef l_vecctr} {$undef pushvec} {$undef argvec} {$undef pushargvec}
+	{$undef vecf}}
+
+{$define all_script_lookups :=
+	{$if defined(chans) or defined(storagetype) or defined(imagereadfunc) or defined(lookupfunc) or defined(bindinglookupfunc) or
+		defined(scriptlookupname) or defined(storagedefault)}
+		{$error all_script_lookups would hide defines}
+	{$endif}
+
+	{$define chans := 1} {$define storagetype := float} {$define imagereadfunc := ReadG} {$define lookupfunc := LookupG}
+	{$define bindinglookupfunc := l_image_g} {$define scriptlookupname := 'g'} {$define storagedefault := 0} lookupf
+
+	{$define chans := 2} {$define storagetype := Vec2} {$define imagereadfunc := ReadGA} {$define lookupfunc := LookupGA}
+	{$define bindinglookupfunc := l_image_ga} {$define scriptlookupname := 'ga'} {$define storagedefault := Vec2.Make(0, 1)} lookupf
+
+	{$define chans := 3} {$define storagetype := Vec3} {$define imagereadfunc := ReadRGB} {$define lookupfunc := LookupRGB}
+	{$define bindinglookupfunc := l_image_rgb} {$define scriptlookupname := 'rgb'} {$define storagedefault := Vec3.Make(0, 0, 0)} lookupf
+
+	{$define chans := 4} {$define storagetype := Vec4} {$define imagereadfunc := ReadRGBA} {$define lookupfunc := LookupRGBA}
+	{$define bindinglookupfunc := l_image_rgba} {$define scriptlookupname := 'rgba'} {$define storagedefault := Vec4.Make(0, 0, 0, 1)} lookupf
+
+	{$undef chans} {$undef storagetype} {$undef imagereadfunc} {$undef lookupfunc}
+	{$undef bindinglookupfunc} {$undef scriptlookupname} {$undef storagedefault}
+	{$undef lookupf}}
 
 type
-	GenerateByScriptFormulaOperation = class(GenericOpPayload)
+	GenerateByScriptOperation = class(GenericOpPayload)
 		lock: ThreadLock;
-		fileSourceIndex: SizeInt;
-		source, funcName: string;
-
-		// в этом стейте вызывается init, затем функция для первого пикселя, чтобы по тому, что она вернёт, определить формат,
-		// в дальнейшем этот стейт используется потоком 0, остальные создают себе отдельные.
-		L0: lua.State;
+		source, chunkName: string;
+		spec: ImageSpec;
+		forceSize, forceFormat: boolean;
 
 		constructor Create;
 		destructor Destroy; override;
@@ -5161,81 +5308,980 @@ type
 		Reg_Vec2MT = lua.RIDX_LAST + 1;
 		Reg_Vec3MT = Reg_Vec2MT + 1;
 		Reg_Vec4MT = Reg_Vec3MT + 1;
-		Reg_ImageMT = Reg_Vec4MT + 1;
+		Reg_VecMT2VecLen = Reg_Vec4MT + 1;
+		Reg_ImageMT = Reg_VecMT2VecLen + 1;
+
+	type
+		ScriptState = class(TObjectEx)
+			L: lua.State; // userparamptr^ = @self
+			op: GenerateByScriptOperation;
+			x, y, f: SizeUint;
+			intercepted: boolean;
+			constructor Create(op: GenerateByScriptOperation);
+			destructor Destroy; override;
+			function CallGetPixel(var r: Vec4): uint;
+		private
+			procedure Setup; // экспозит все возможности в _G
+			class function HumanValue(L: lua.State; index: cint): string; static;
+			class function HumanArgs(L: lua.State; first, last: cint): string; static;
+			class procedure ArgError(L: lua.State; const funcName: string; argIndex, first, last: cint; const extra: string = ''); noreturn; static;
+			class procedure ArgError(L: lua.State; const funcName: string; argIndex: cint; const extra: string = ''); noreturn; static;
+
+			class procedure Hook(L: lua.State; var ar: lua.Debug); cdecl; static;
+			class function l_indexenv(L: lua.State): cint; cdecl; static;
+
+			class function VecLen(L: lua.State; index: cint): uint; static;
+		{$define vecf :=
+			class function l_vecctr(L: lua.State): cint; cdecl; static;
+			class procedure pushvec(L: lua.State; const v: vec); static;
+			class function argvec(L: lua.State; index: cint; out args: uint; const func: string): vec; static;
+			class function pushargvec(L: lua.State; const v: vec; scatter: boolean): cint; static;} all_script_vectors
+			class function l_vecindex(L: lua.State): cint; cdecl; static;
+			class function l_vecadd(L: lua.State): cint; cdecl; static;
+			class function l_vecsub(L: lua.State): cint; cdecl; static;
+			class function l_vecmul(L: lua.State): cint; cdecl; static;
+			class function l_vecdiv(L: lua.State): cint; cdecl; static;
+			class function l_vecunm(L: lua.State): cint; cdecl; static;
+			class procedure BadBinOp(L: lua.State; const op: string); static;
+			class function l_min(L: lua.State): cint; cdecl; static;
+			class function l_max(L: lua.State): cint; cdecl; static;
+			class function l_abs(L: lua.State): cint; cdecl; static;
+			class function l_clamp(L: lua.State): cint; cdecl; static;
+			class function l_lerp(L: lua.State): cint; cdecl; static;
+			class function l_sin(L: lua.State): cint; cdecl; static;
+			class function l_cos(L: lua.State): cint; cdecl; static;
+			class function l_smoothstep(L: lua.State): cint; cdecl; static;
+			class function l_hsv2rgb(L: lua.State): cint; cdecl; static;
+			class function l_rgb2hsv(L: lua.State): cint; cdecl; static;
+			class function SelfToImage(L: lua.State; const func: string): pImage; static;
+			class function SelfToImageUnchecked(L: lua.State): pImage; static;
+			class function MaybePixelPtr(var im: Image; const v: Vec2): pointer; static;
+		{$define lookupf :=
+			class function lookupfunc(var im: Image; const v: Vec2): storagetype; static;
+			class function bindinglookupfunc(L: lua.State): cint; cdecl; static;} all_script_lookups
+			class function l_image_index(L: lua.State): cint; cdecl; static;
+		end;
+
+	var
+		// в этом стейте вызывается функция для первого пикселя, чтобы по тому, что она вернёт, определить формат результата.
+		// В дальнейшем этот стейт используется потоком 0, остальные создают себе отдельные.
+		ss0: ScriptState;
 	end;
 
-	constructor GenerateByScriptFormulaOperation.Create;
+	constructor GenerateByScriptOperation.Create;
 	begin
 		inherited Create;
 		lock.Init;
-		fileSourceIndex := -1;
 	end;
 
-	destructor GenerateByScriptFormulaOperation.Destroy;
+	destructor GenerateByScriptOperation.Destroy;
 	begin
+		ss0.Free(ss0);
 		lock.Done;
 		inherited Destroy;
 	end;
 
-	procedure GenerateByScriptFormulaOperation.Start;
-	begin
+	procedure GenerateByScriptOperation.Start;
+	var
+		r: Vec4;
+		acceptLen, cpLen: SizeInt;
+	begin {$define args := r} unused_args
+		if source = '' then raise Exception.Create('Формула не задана.');
+
+		// ScriptState.Create вызывает Setup. Setup выставляет oim.w/oim.h в глобальные переменные.
+		// Даже если бы они читались в _G.__index, здесь чуть ниже вызывается GetPixel, которая её дёрнет.
+		Image.ValidateSize(spec, op.oname.name);
+		if not forceSize and not Ary(op.inputs).Empty and Assigned(op.inputs[0].im) then
+		begin
+			spec.w := op.inputs[0].im^.im.w;
+			spec.h := op.inputs[0].im^.im.h;
+		end;
+
+		oim.spec := spec;
+
+		ss0 := ScriptState.Create(self);
+		if chunkName = '' then chunkName := source + EOL;
+
+		// Lua отрежет название, если оно слишком длинное. Сделать это самому, красивее.
+		if length(chunkName) > lua.IDSIZE - 10 then
+		begin
+			acceptLen := 0;
+			while (1 + acceptLen <= length(chunkName)) do
+			begin
+				cpLen := chunkName.CodepointLen(1 + acceptLen);
+				if acceptLen + cpLen <= lua.IDSIZE - 10 then acceptLen += cpLen else break;
+			end;
+			chunkName := chunkName.Head(acceptLen) + '(...)' + IfThen(chunkName.ConsumeRev([#13, #10], length(chunkName)) < length(chunkName), EOL);
+		end;
+
+		try
+			lua.loadstringE(ss0.L, [source], chunkName);
+		except
+			on e: Exception do
+			begin
+				e.msg := lua.striplinenumber(e.msg, chunkName);
+				raise;
+			end;
+		end;
+
+		if not forceFormat then
+			case ss0.CallGetPixel(r) of
+				1: spec.format := ImageFormat.G;
+				2: spec.format := ImageFormat.GA;
+				3: spec.format := ImageFormat.RGB;
+				4: spec.format := ImageFormat.RGBA;
+			end;
+		oim.Init(op.oname.name, nil, spec);
 	end;
 
-	procedure GenerateByScriptFormulaOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
+	procedure GenerateByScriptOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
+		function Mismatch(nc: uint): Exception;
+		begin
+			result := Exception.Create('Формула вернула {} значени{е/я/й}, ожидается 1-4.'.Format([VarRec.uint(nc), oim.format.id]));
+		end;
+	var
+		ss: ScriptState;
+		pixel, psz: SizeUint;
+		r: Vec4;
+		nc: uint;
+		ofs: pointer;
+	begin {$define args := r} unused_args
+		pixel := startPixel;
+		psz := oim.format.pixelSize;
+
+		ss := nil;
+		try
+			if threadIndex = 0 then ss := ss0 else
+			begin
+				ss := ScriptState.Create(self);
+				lua.loadstringE(ss.L, [source], chunkName);
+			end;
+			oim.DecodePixelNumber(pixel, ss.x, ss.y, ss.f, ofs);
+
+			while pixel < endPixel do
+			begin
+				nc := ss.CallGetPixel(r);
+				case nc of
+					1: Image.WriteG(ofs, oim.format, r.data[0]);
+					2: Image.WriteGA(ofs, oim.format, pVec2(@r)^);
+					3: Image.WriteRGB(ofs, oim.format, pVec3(@r)^);
+					4: Image.WriteRGBA(ofs, oim.format, r);
+				end;
+				oim.NextPixel(pixel, ss.x, ss.y, ss.f);
+				ofs += psz;
+				if pixel mod MixOperation.ReportPeriodPixels = 0 then op.NoteProgress(threadIndex, (pixel - startPixel) / (endPixel - startPixel));
+			end;
+		finally
+			if ss <> ss0 then ss.Free(ss);
+		end;
+	end;
+
+	constructor GenerateByScriptOperation.ScriptState.Create(op: GenerateByScriptOperation);
 	begin
+		inherited Create;
+		self.op := op;
+		L := lua.newstate(lua.Alloc(@lua.default_alloc), nil);
+		lua.userparamptr(L)^ := self;
+		lua.atpanic(L, lua.CFunction(@lua.default_panic));
+		lua.onthrow(L, lua.Throwf(@lua.default_throw), lua.Pcallf(@lua.default_pcall));
+		lua.sethook(L, lua.Hook(@ScriptState.Hook), lua.MASKCOUNT, 100000);
+		Setup;
+	end;
+
+	destructor GenerateByScriptOperation.ScriptState.Destroy;
+	begin
+		if Assigned(L) then lua.close(L);
+		inherited Destroy;
+	end;
+
+	// на вершине стека ожидается функция; она НЕ снимается со стека
+	function GenerateByScriptOperation.ScriptState.CallGetPixel(var r: Vec4): uint;
+	var
+		top, first, nr, i: cint;
+	begin
+		top := lua.gettop(L);
+		lua.pushvalue(L, -1); // (top)func func
+		if lua.pcall(L, 0, lua.MULTRET, 0) <> lua.OK then
+		begin
+			// Lua-хук, чтобы не бросать исключение сквозь Lua-фреймы, преобразует его lua_error с простым сообщением об ошибке, т. е. тип теряется.
+			// Для Interception он запоминается ad-hoc, чтобы отличить эту ситуацию.
+			if intercepted then op.op.Intercept;
+			raise Exception.Create(lua.striplinenumber(lua.tostring(L, -1), op.chunkName));
+		end;
+		first := top + 1;
+		// func (first)...результаты...
+
+		nr := lua.gettop(L) - top;
+		case nr of
+			1:
+				case lua.&type(L, first) of
+					lua.TNUMBER: // градация серого
+						begin
+							r.data[0] := lua.tonumberx(L, first, nil);
+							result := 1;
+						end;
+					lua.TUSERDATA: // вектор
+						case VecLen(L, first) of
+							2: begin pVec2(@r)^ := pVec2(lua.touserdata(L, first))^; result := 2; end;
+							3: begin pVec3(@r)^ := pVec3(lua.touserdata(L, first))^; result := 3; end;
+							4: begin r := pVec4(lua.touserdata(L, first))^; result := 4; end;
+							else result := 0;
+						end;
+					else result := 0;
+				end;
+			2, 3, 4: // вектор как N чисел.
+				begin
+					result := nr;
+					for i := first to first + nr - 1 do
+						if lua.&type(L, i) = lua.TNUMBER then r.data[i-first] := lua.tonumberx(L, i, nil) else result := 0;
+				end;
+			else result := 0;
+		end;
+
+		if result = 0 then
+			raise Exception.Create('Формула {}; ожидается 1 вектор или от 1 до 4 чисел.'.Format([
+				IfThen(nr > 0, 'вернула ({})'.Format([HumanArgs(L, first, first + nr - 1)]), 'ничего не вернула')]));
+		lua.settop(L, top);
+	end;
+
+	procedure GenerateByScriptOperation.ScriptState.Setup;
+	var
+		i: SizeInt;
+	begin
+	{$define vecf :=
+		lua.newtable(L);
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_vecindex)); lua.setfield(L, -2, '__index');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_vecadd)); lua.setfield(L, -2, '__add');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_vecsub)); lua.setfield(L, -2, '__sub');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_vecmul)); lua.setfield(L, -2, '__mul');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_vecdiv)); lua.setfield(L, -2, '__div');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_vecunm)); lua.setfield(L, -2, '__unm');
+		lua.rawseti(L, lua.REGISTRYINDEX, vecMT);} all_script_vectors
+		lua.newtable(L);
+		{$define vecf :=
+			lua.rawgeti(L, lua.REGISTRYINDEX, vecMT); lua.pushinteger(L, vecn); lua.rawset(L, -3);} all_script_vectors
+		lua.rawseti(L, lua.REGISTRYINDEX, Reg_VecMT2VecLen);
+		lua.newtable(L);
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_image_index)); lua.setfield(L, -2, '__index');
+		lua.rawseti(L, lua.REGISTRYINDEX, Reg_ImageMT);
+
+		lua.rawgeti(L, lua.REGISTRYINDEX, lua.RIDX_GLOBALS); // _G
+			lua.pushinteger(L, op.oim.w); lua.setfield(L, -2, 'w');
+			lua.pushinteger(L, op.oim.h); lua.setfield(L, -2, 'h');
+			lua.pushinteger(L, op.oim.frames); lua.setfield(L, -2, 'frames');
+			PushVec2(L, Vec2.Make(op.oim.w, op.oim.h)); lua.setfield(L, -2, 'wh');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_min)); lua.setfield(L, -2, 'min');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_max)); lua.setfield(L, -2, 'max');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_abs)); lua.setfield(L, -2, 'abs');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_clamp)); lua.setfield(L, -2, 'clamp');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_lerp)); lua.setfield(L, -2, 'lerp');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_sin)); lua.setfield(L, -2, 'sin');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_cos)); lua.setfield(L, -2, 'cos');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_smoothstep)); lua.setfield(L, -2, 'smoothstep');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_hsv2rgb)); lua.setfield(L, -2, 'hsv2rgb');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_rgb2hsv)); lua.setfield(L, -2, 'rgb2hsv');
+			for i := 0 to High(op.op.inputs) do
+				if Assigned(op.op.inputs[i].im) then
+				begin
+					pPointer(lua.newuserdata(L, sizeof(pointer)))^ := @op.op.inputs[i].im^.im;
+					lua.rawgeti(L, lua.REGISTRYINDEX, Reg_ImageMT); lua.setmetatable(L, -2);
+					if i = 0 then begin lua.pushvalue(L, -1); lua.setfield(L, -3, 'im'); end;
+					lua.setfield(L, -2, pChar('im' + im.ToString(1 + i)));
+				end;
+		{$define vecf := lua.pushcfunction(L, lua.CFunction(@ScriptState.l_vecctr)); lua.setfield(L, -2, vecname);} all_script_vectors
+			lua.newtable(L); // _G gMT
+				lua.pushcfunction(L, lua.CFunction(@ScriptState.l_indexenv)); lua.setfield(L, -2, '__index');
+			lua.setmetatable(L, -2); // _G
+		lua.pop(L);
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.HumanValue(L: lua.State; index: cint): string;
+	begin
+		case lua.&type(L, index) of
+			lua.TBOOLEAN: result := IfThen(lua.toboolean(L, index), 'true', 'false');
+			lua.TNUMBER: if lua.isinteger(L, index) then result := im.ToString(lua.tointegerx(L, index, nil)) else result := im.ToString(lua.tonumberx(L, index, nil));
+			lua.TSTRING: result := '"' + lua.tostring(L, index) + '"';
+			lua.TUSERDATA:
+				case VecLen(L, index) of
+				{$define vecf :=
+					vecn: result := '{}({})'.Format([vecname, pvec(lua.touserdata(L, index))^.ToString]);} all_script_vectors
+					else
+					begin
+						result := '';
+						if lua.getmetatable(L, 1) <> 0 then
+						begin
+							lua.rawgeti(L, lua.REGISTRYINDEX, Reg_ImageMT); if lua.rawequal(L, -2, -1) then result := 'im'; lua.pop(L);
+							lua.pop(L);
+						end;
+						if result = '' then result := '<{}>'.Format([lua.typename(L, lua.&type(L, index))]);
+					end;
+				end;
+			else result := lua.typename(L, lua.&type(L, index));
+		end;
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.HumanArgs(L: lua.State; first, last: cint): string;
+	var
+		index: cint;
+	begin
+		for index := first to last do
+			result += IfThen(index > first, ', ') + HumanValue(L, index);
+	end;
+
+	class procedure GenerateByScriptOperation.ScriptState.ArgError(L: lua.State; const funcName: string; argIndex, first, last: cint; const extra: string = '');
+	var
+		args: string;
+		index: cint;
+	begin
+		args := '';
+		for index := first to last do
+			args += IfThen(index > first, ', ') + IfThen(argIndex = index, '>') + HumanValue(L, index);
+		if argIndex > last then args += IfThen(args <> '', ', ') + '..?';
+		lua.throw(L, '{}({}){}{}'.Format([funcName, args, IfThen(extra <> '', ': '), extra]));
+	end;
+
+	class procedure GenerateByScriptOperation.ScriptState.ArgError(L: lua.State; const funcName: string; argIndex: cint; const extra: string = '');
+	begin
+		ArgError(L, funcName, argIndex, 1, lua.gettop(L), extra);
+	end;
+
+	class procedure GenerateByScriptOperation.ScriptState.Hook(L: lua.State; var ar: lua.Debug); cdecl;
+	var
+		ss: ScriptState;
+	begin {$define args := ar} unused_args
+		ss := ScriptState(lua.userparamptr(L)^);
+		try
+			ss.op.op.Intercept;
+		except
+			on e: TObject do
+			begin
+				if e is Interception then ss.intercepted := true;
+				lua.throw(L, Exception.Message);
+			end;
+		end;
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.l_indexenv(L: lua.State): cint; cdecl;
+		function WhatImage(L: lua.State; p: pChar; out ss: ScriptState; out im: pImage): boolean;
+		var
+			index: uint;
+		begin
+			ss := ScriptState(lua.userparamptr(L)^);
+			index := 0;
+			if p^ <> #0 then
+			begin
+				repeat
+					if (p^ >= '0') and (p^ <= '9') then
+					begin
+						index := index * 10 + uint(ord(p^) - ord('0'));
+						if index > SizeUint(length(ss.op.op.inputs)) then exit(false);
+					end else
+						if p^ = #0 then break else exit(false);
+					inc(p);
+				until false;
+				if index = 0 then exit(false);
+				dec(index);
+			end;
+
+			result := (index < SizeUint(length(ss.op.op.inputs))) and Assigned(ss.op.op.inputs[index].im);
+			if result then im := @ss.op.op.inputs[index].im^.im;
+		end;
+	var
+		p: pChar;
+		ss: ScriptState;
+		im: pImage;
+	begin
+		result := 0;
+		p := lua.topchar(L, 2);
+		if Assigned(p) then
+			case p[0] of
+				'x':
+					case p[1] of
+						#0: begin ss := ScriptState(lua.userparamptr(L)^); lua.pushinteger(L, ss.x); result := 1; end;
+						'y': if p[2] = #0 then begin ss := ScriptState(lua.userparamptr(L)^); PushVec2(L, Vec2.Make(ss.x, ss.y)); result := 1; end;
+					end;
+				'y': if p[1] = #0 then begin ss := ScriptState(lua.userparamptr(L)^); lua.pushinteger(L, ss.y); result := 1; end;
+				'f': if p[1] = #0 then begin ss := ScriptState(lua.userparamptr(L)^); lua.pushinteger(L, ss.f); result := 1; end;
+				'n':
+					case p[1] of
+						'x':
+							case p[2] of
+								#0: begin ss := ScriptState(lua.userparamptr(L)^); lua.pushnumber(L, ss.x/ss.op.oim.w); result := 1; end;
+								'y': if p[3] = #0 then begin ss := ScriptState(lua.userparamptr(L)^); PushVec2(L, Vec2.Make(ss.x/ss.op.oim.w, ss.y/ss.op.oim.h)); result := 1; end;
+							end;
+						'y': if p[2] = #0 then begin ss := ScriptState(lua.userparamptr(L)^); lua.pushnumber(L, ss.y/ss.op.oim.h); result := 1; end;
+						'f': if p[2] = #0 then begin ss := ScriptState(lua.userparamptr(L)^); lua.pushnumber(L, ss.f/ss.op.oim.frames); result := 1; end;
+					end;
+				'r':
+					if (p[1] = 'g') and (p[2] = 'b') then
+						if p[3] = 'a' then
+							if WhatImage(L, p + 4, ss, im) then begin PushVec4(L, LookupRGBA(im^, Vec2.Make(ss.x, ss.y))); result := 1; end else
+						else if WhatImage(L, p + 3, ss, im) then begin PushVec3(L, LookupRGB(im^, Vec2.Make(ss.x, ss.y))); result := 1; end else
+					else if WhatImage(L, p + 1, ss, im) then begin lua.pushnumber(L, LookupRGB(im^, Vec2.Make(ss.x, ss.y)).x); result := 1; end;
+				'g':
+					if (p[1] = 'r') and (p[2] = 'a') and (p[3] = 'y') then
+						if WhatImage(L, p + 4, ss, im) then begin lua.pushnumber(L, LookupG(im^, Vec2.Make(ss.x, ss.y))); result := 1; end else
+					else if (p[1] = 'a') and WhatImage(L, p + 2, ss, im) then begin PushVec2(L, LookupGA(im^, Vec2.Make(ss.x, ss.y))); result := 1; end
+					else if WhatImage(L, p + 1, ss, im) then begin lua.pushnumber(L, LookupRGB(im^, Vec2.Make(ss.x, ss.y)).y); result := 1; end;
+				'b': if WhatImage(L, p + 1, ss, im) then begin lua.pushnumber(L, LookupRGB(im^, Vec2.Make(ss.x, ss.y)).z); result := 1; end;
+				'a': if WhatImage(L, p + 1, ss, im) then begin lua.pushnumber(L, LookupRGBA(im^, Vec2.Make(ss.x, ss.y)).w); result := 1; end;
+			end;
+		if result = 0 then lua.throw(L, 'Переменная {} не определена.'.Format([HumanValue(L, 2)]));
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.VecLen(L: lua.State; index: cint): uint;
+	begin
+		if lua.getmetatable(L, index) = 0 then exit(0); // mt
+		lua.rawgeti(L, lua.REGISTRYINDEX, Reg_VecMT2VecLen); // mt mt2len
+		lua.pushvalue(L, -2); // mt mt2len mt
+		lua.rawget(L, -2); // mt mt2len len
+		result := lua.tointegerx(L, -1, nil);
+		lua.pop(L, 3);
+	end;
+
+{$define vecf :=
+	class function GenerateByScriptOperation.ScriptState.l_vecctr(L: lua.State): cint; cdecl;
+	var
+		args, iarg, icomp: cint;
+		i, nv: uint;
+		v: vec;
+		procedure AE; begin ArgError(L, vecname, iarg); end;
+	begin
+		args := lua.gettop(L);
+		iarg := 1;
+		icomp := 0;
+		while (iarg <= args) and (icomp < length(v.data)) do
+		begin
+			case lua.&type(L, iarg) of
+				lua.TNUMBER:
+					begin
+						v.data[icomp] := lua.tonumberx(L, iarg, nil); inc(icomp);
+						if args = 1 then
+							while icomp < length(v.data) do begin v.data[icomp] := v.data[0]; inc(icomp); end;
+					end;
+				lua.TUSERDATA:
+					begin
+						nv := VecLen(L, iarg); if nv = 0 then AE;
+						i := 0;
+						while (i < nv) and (icomp < length(v.data)) do
+						begin
+							v.data[icomp] := Vec4.LinearData(lua.touserdata(L, iarg)^)[i];
+							inc(i); inc(icomp);
+						end;
+					end;
+				else AE;
+			end;
+			inc(iarg);
+		end;
+		if iarg < args then AE;
+
+		while icomp < length(v.data) do
+		begin
+			if icomp < 3 then v.data[icomp] := 0 else v.data[icomp] := 1;
+			inc(icomp);
+		end;
+		pushvec(L, v);
+		result := 1;
+	end;
+
+	class procedure GenerateByScriptOperation.ScriptState.pushvec(L: lua.State; const v: vec);
+	begin
+		vec(lua.newuserdata(L, sizeof(v))^) := v;
+		lua.rawgeti(L, lua.REGISTRYINDEX, vecMT); lua.setmetatable(L, -2);
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.argvec(L: lua.State; index: cint; out args: uint; const func: string): vec;
+		procedure AE(index: cint); noreturn; begin ArgError(L, func, index); end;
+	var
+		i: cint;
+	begin
+		case lua.&type(L, index) of
+			lua.TNUMBER:
+				begin
+					result.data[0] := lua.tonumberx(L, index, nil);
+					for i := 1 to High(result.data) do
+						if lua.&type(L, index + i) = lua.TNUMBER then
+							result.data[i] := lua.tonumberx(L, index + i, nil)
+						else
+							AE(index + i);
+					args := length(result.data);
+				end;
+			lua.TUSERDATA:
+				if VecLen(L, index) = vecn then
+				begin
+					result := pvec(lua.touserdata(L, index))^;
+					args := 1;
+				end else
+					AE(index);
+			else AE(index);
+		end;
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.pushargvec(L: lua.State; const v: vec; scatter: boolean): cint;
+	var
+		i: uint;
+	begin
+		if scatter then
+		begin
+			for i := 0 to High(v.data) do lua.pushnumber(L, v.data[i]);
+			result := length(v.data);
+		end else
+		begin
+			pushvec(L, v);
+			result := 1;
+		end;
+	end;} all_script_vectors
+
+	class function GenerateByScriptOperation.ScriptState.l_vecindex(L: lua.State): cint; cdecl;
+		function Swizzle(L: lua.State; p: pChar; v: pointer; len: uint): cint;
+		var
+			i, n: csize_t;
+			cidx: uint;
+			r: Vec4;
+		begin
+			n := lua.rawlen(L, 2);
+			if (n < 1) or (n > 4) then exit(0);
+			i := 0;
+			while i < n do
+			begin
+				case p[i] of
+					'x', 'r': cidx := 0;
+					'y': cidx := 1;
+					'z', 'b': cidx := 2;
+					'w': cidx := 3;
+					'g': if len = 2 then cidx := 0 else cidx := 1;
+					'a': if len = 2 then cidx := 1 else cidx := 3;
+					'0': begin r.data[i] := 0; inc(i); continue; end;
+					'1': begin r.data[i] := 1; inc(i); continue; end;
+					else exit(0);
+				end;
+				if cidx >= len then exit(0);
+				r.data[i] := pVec4(v)^.data[cidx];
+				inc(i);
+			end;
+			case n of
+				1: begin lua.pushnumber(L, r.data[0]); result := 1; end;
+			{$define vecf := vecn: begin pushvec(L, pvec(@r)^); result := 1; end;} all_script_vectors else result := 0;
+			end;
+		end;
+
+		function IndexByString(L: lua.State; v: pointer; len: uint): cint;
+		var
+			p: pChar;
+		begin
+			result := 0;
+			p := lua.topchar(L, 2);
+			case p[0] of
+				'l':
+					if (p[1] = 'e') and (p[2] = 'n') and (p[3] = #0) then
+						case len of
+						{$define vecf := vecn: begin lua.pushnumber(L, vec(v^).Length); result := 1; end;} all_script_vectors
+						end;
+				's':
+					if (p[1] = 'q') and (p[2] = 'l') and (p[3] = 'e') and (p[4] = 'n') and (p[5] = #0) then
+						case len of
+						{$define vecf := vecn: begin lua.pushnumber(L, vec(v^).SquareLength); result := 1; end;} all_script_vectors
+						end;
+				'n':
+					if (p[1] = 'n') and (p[2] = #0) then
+						case len of
+						{$define vecf := vecn: begin pushvec(L, vec(v^).Normalized); result := 1; end;} all_script_vectors
+						end;
+				else result := Swizzle(L, p, v, len);
+			end;
+		end;
+
+		function IndexByNumber(L: lua.State; v: pointer; len: uint): cint;
+		var
+			lint: cint;
+			isnum: cint;
+		begin
+			lint := lua.tointegerx(L, 2, @isnum);
+			if (isnum <> 0) and (lint >= 1) and (uint(lint) <= len) then
+			begin
+				lua.pushnumber(L, pVec4(v)^.data[lint-1]);
+				result := 1;
+			end else
+				result := 0;
+		end;
+
+	var
+		len: uint;
+		v: pointer;
+
+	begin
+		v := lua.touserdata(L, 1);
+		len := VecLen(L, 1);
+		case lua.&type(L, 2) of
+			lua.TSTRING: result := IndexByString(L, v, len);
+			lua.TNUMBER: result := IndexByNumber(L, v, len);
+			else result := 0;
+		end;
+		if result <> 1 then lua.throw(L, 'vec{}.{}'.Format([len, HumanValue(L, 2)]));
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.l_vecadd(L: lua.State): cint; cdecl;
+	var
+		len: uint;
+	begin
+		len := VecLen(L, 1);
+		if len <> VecLen(L, 2) then lua.throw(L, '{} + {}'.Format([HumanValue(L, 1), HumanValue(L, 2)]));
+		case len of
+		{$define vecf := vecn: pushvec(L, pvec(lua.touserdata(L, 1))^ + pvec(lua.touserdata(L, 2))^);} all_script_vectors else BadBinOp(L, '+');
+		end;
+		result := 1;
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.l_vecsub(L: lua.State): cint; cdecl;
+	var
+		len: uint;
+	begin
+		len := VecLen(L, 1);
+		if len <> VecLen(L, 2) then lua.throw(L, '{} - {}'.Format([HumanValue(L, 1), HumanValue(L, 2)]));
+		case len of
+		{$define vecf := vecn: pushvec(L, pvec(lua.touserdata(L, 1))^ - pvec(lua.touserdata(L, 2))^);} all_script_vectors else BadBinOp(L, '-');
+		end;
+		result := 1;
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.l_vecmul(L: lua.State): cint; cdecl;
+		procedure bynum(L: lua.State; nidx, vidx: cint);
+		begin
+			case VecLen(L, vidx) of
+			{$define vecf := vecn: pushvec(L, lua.tonumberx(L, nidx, nil) * pvec(lua.touserdata(L, vidx))^);} all_script_vectors else BadBinOp(L, '*');
+			end;
+		end;
+	var
+		len: uint;
+	begin
+		if lua.&type(L, 1) = lua.TNUMBER then bynum(L, 1, 2)
+		else if lua.&type(L, 2) = lua.TNUMBER then bynum(L, 2, 1)
+		else
+		begin
+			len := VecLen(L, 1);
+			if len <> VecLen(L, 2) then lua.throw(L, '{} * {}'.Format([HumanValue(L, 1), HumanValue(L, 2)]));
+			case len of
+			{$define vecf := vecn: pushvec(L, pvec(lua.touserdata(L, 1))^ * pvec(lua.touserdata(L, 2))^);} all_script_vectors else BadBinOp(L, '*');
+			end;
+		end;
+		result := 1;
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.l_vecdiv(L: lua.State): cint; cdecl;
+	var
+		len: uint;
+	begin
+		if lua.&type(L, 1) = lua.TNUMBER then
+			case VecLen(L, 2) of
+			{$define vecf := vecn: pushvec(L, lua.tonumberx(L, 1, nil) / pvec(lua.touserdata(L, 2))^);} all_script_vectors else BadBinOp(L, '/');
+			end
+		else if lua.&type(L, 2) = lua.TNUMBER then
+			case VecLen(L, 1) of
+			{$define vecf := vecn: pushvec(L, pvec(lua.touserdata(L, 1))^ / lua.tonumberx(L, 2, nil));} all_script_vectors else BadBinOp(L, '/');
+			end
+		else
+		begin
+			len := VecLen(L, 1);
+			if len <> VecLen(L, 2) then lua.throw(L, '{} / {}'.Format([HumanValue(L, 1), HumanValue(L, 2)]));
+			case len of
+			{$define vecf := vecn: pushvec(L, pvec(lua.touserdata(L, 1))^ / pvec(lua.touserdata(L, 2))^);} all_script_vectors else BadBinOp(L, '/');
+			end;
+		end;
+		result := 1;
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.l_vecunm(L: lua.State): cint; cdecl;
+	begin
+		case VecLen(L, 1) of
+		{$define vecf := vecn: pushvec(L, -pvec(lua.touserdata(L, 1))^);} all_script_vectors else lua.throw(L, '-{}'.Format([HumanValue(L, 1)]));
+		end;
+		result := 1;
+	end;
+
+	class procedure GenerateByScriptOperation.ScriptState.BadBinOp(L: lua.State; const op: string);
+	begin
+		lua.throw(L, '{} {} {}'.Format([HumanValue(L, 1), op, HumanValue(L, 2)]));
+	end;
+
+	// https://ru.wikipedia.org/wiki/HSV_(цветовая_модель)#Преобразования_цветовых_компонентов_между_моделями
+	// Я не уверен, нужна ли здесь по-хорошему гамма-коррекция для V. На всякий случай ничего не трогал.
+	function HSVToRGB(const hsv: Vec3): Vec3;
+	var
+		h, v, vMin, a: float;
+	begin
+		h := clamp(frac(hsv.x), 0, 1) * 6;
+		v := clamp(hsv.z, 0, 1);
+		vMin := (1 - clamp(hsv.y, 0, 1)) * v;
+		a := (v - vMin) * frac(h);
+
+		case trunc(h) of
+			0: result := Vec3.Make(v, vMin + a, vMin);
+			1: result := Vec3.Make(v - a, v, vMin);
+			2: result := Vec3.Make(vMin, v, vMin + a);
+			3: result := Vec3.Make(vMin, v - a, v);
+			4: result := Vec3.Make(vMin + a, vMin, v);
+			else result := Vec3.Make(v, vMin, v - a);
+		end;
+	end;
+
+	function RGBToHSV(const rgb: Vec3): Vec3;
+	var
+		cmax, cmin: float;
+	begin
+		cmax := max(max(rgb.x, rgb.y), rgb.z);
+		cmin := min(min(rgb.x, rgb.y), rgb.z);
+		if cmax = cmin then result.x := 0
+		else if cmax = rgb.x then
+			if rgb.y >= rgb.z then result.x := (rgb.y - rgb.z) / (cmax - cmin) / 6 else result.x := 1 + (rgb.y - rgb.z) / (cmax - cmin) / 6
+		else if cmax = rgb.y then result.x := (2/6) + (rgb.z - rgb.x) / (cmax - cmin) / 6
+		else result.x := (4/6) + (rgb.x - rgb.y) / (cmax - cmin) / 6;
+		if cmax = 0 then result.y := 0 else result.y := 1 - cmin/cmax;
+		result.z := cmax;
+	end;
+
+{$define opimpl :=
+		procedure AE(index: cint); noreturn; begin ArgError(L, funcname, index); end;
+	var
+	{$if not defined(per_component)} iarg: cint; {$endif}
+		r: array[0 .. 3] of lua.Number;
+		iv, vlen: uint;
+		v: {$if defined(ternary)} array[1 .. 3] of {$elseif defined(x_erp)} array[1 .. 2] of {$endif} pointer;
+	begin
+		case lua.&type(L, 1) of
+			lua.TNUMBER:
+				begin
+				{$if defined(minmax)}
+					r[0] := lua.tonumberx(L, 1, nil);
+					for iarg := 2 to lua.gettop(L) do
+					begin
+						if lua.&type(L, iarg) <> lua.TNUMBER then AE(iarg);
+						r[0] := func(r[0], lua.tonumberx(L, iarg, nil));
+					end;
+				{$elseif defined(ternary) or defined(x_erp)}
+					for iarg := 2 to 3 do
+						if lua.&type(L, iarg) <> lua.TNUMBER then AE(iarg);
+					r[0] := func(lua.tonumberx(L, 1, nil), lua.tonumberx(L, 2, nil), lua.tonumberx(L, 3, nil));
+				{$elseif defined(per_component)}
+					r[0] := func(lua.tonumberx(L, 1, nil));
+				{$else} {$error not minmax, not ternary, not interpolation, not per-component operation, so what is it?} {$endif}
+					lua.pushnumber(L, r[0]); result := 1;
+				end;
+
+			lua.TUSERDATA:
+				begin
+					vlen := VecLen(L, 1); if vlen = 0 then AE(1);
+					v {$if defined(ternary) or defined(x_erp)} [1] {$endif} := lua.touserdata(L, 1);
+				{$if defined(minmax)}
+					for iv := 0 to vlen - 1 do
+						r[iv] := pVec4(v)^.data[iv];
+
+					for iarg := 2 to lua.gettop(L) do
+					begin
+						if VecLen(L, iarg) <> vlen then AE(iarg);
+						v := lua.touserdata(L, iarg);
+						for iv := 0 to vlen - 1 do
+							r[iv] := func(r[iv], pVec4(v)^.data[iv]);
+					end;
+				{$elseif defined(ternary)}
+					for iarg := 2 to 3 do
+					begin
+						if VecLen(L, iarg) <> vlen then AE(iarg);
+						v[iarg] := lua.touserdata(L, iarg);
+					end;
+					for iv := 0 to vlen - 1 do
+						r[iv] := func(pVec4(v[1])^.data[iv], pVec4(v[2])^.data[iv], pVec4(v[3])^.data[iv]);
+				{$elseif defined(x_erp)}
+					if VecLen(L, 2) <> vlen then AE(2); v[2] := lua.touserdata(L, 2);
+					if lua.&type(L, 3) <> lua.TNUMBER then AE(3);
+					for iv := 0 to vlen - 1 do
+						r[iv] := func(pVec4(v[1])^.data[iv], pVec4(v[2])^.data[iv], lua.tonumberx(L, 3, nil));
+				{$elseif defined(per_component)}
+					for iv := 0 to vlen - 1 do
+						r[iv] := func(pVec4(v)^.data[iv]);
+				{$else} {$error not minmax, not ternary, not interpolation, not per-component operation, so what is it?} {$endif}
+
+					case vlen of
+					{$define vecf :=
+						vecn: begin pushvec(L, vec.Make(r[0], r[1] {$if vecn >= 3}, r[2] {$endif} {$if vecn >= 4}, r[3] {$endif})); result := 1; end;}
+						all_script_vectors else lua.throw(L, '?!');
+					end;
+					result := 1;
+				end;
+			else AE(1);
+		end;
+{$ifdef suppress_false_dfa_alarms} {$warn 5036 off} {$endif}
+	end;
+{$ifdef suppress_false_dfa_alarms} {$warn 5036 on} {$endif} // 'r' does not seem to be initialized
+	{$undef funcname} {$undef func} {$undef minmax} {$undef ternary} {$undef x_erp} {$undef per_component}}
+
+	class function GenerateByScriptOperation.ScriptState.l_min(L: lua.State): cint; cdecl; {$define funcname := 'min'} {$define func := min} {$define minmax} opimpl
+	class function GenerateByScriptOperation.ScriptState.l_max(L: lua.State): cint; cdecl; {$define funcname := 'max'} {$define func := max} {$define minmax} opimpl
+	class function GenerateByScriptOperation.ScriptState.l_abs(L: lua.State): cint; cdecl; {$define funcname := 'abs'} {$define func := abs} {$define per_component} opimpl
+	class function GenerateByScriptOperation.ScriptState.l_clamp(L: lua.State): cint; cdecl; {$define funcname := 'clamp'} {$define func := clamp} {$define ternary} opimpl
+	class function GenerateByScriptOperation.ScriptState.l_lerp(L: lua.State): cint; cdecl; {$define funcname := 'lerp'} {$define func := lerp} {$define x_erp} opimpl
+	class function GenerateByScriptOperation.ScriptState.l_sin(L: lua.State): cint; cdecl; {$define funcname := 'sin'} {$define func := sin} {$define per_component} opimpl
+	class function GenerateByScriptOperation.ScriptState.l_cos(L: lua.State): cint; cdecl; {$define funcname := 'cos'} {$define func := cos} {$define per_component} opimpl
+	class function GenerateByScriptOperation.ScriptState.l_smoothstep(L: lua.State): cint; cdecl; {$define funcname := 'smoothstep'} {$define func := smoothstep} {$define x_erp} opimpl
+{$undef opimpl}
+
+	class function GenerateByScriptOperation.ScriptState.l_hsv2rgb(L: lua.State): cint; cdecl;
+	var
+		hsv: Vec3;
+		vArgs: uint;
+	begin
+		hsv := ArgVec3(L, 1, vArgs, 'hsv2rgb');
+		result := PushArgVec3(L, HSVToRGB(hsv), vArgs > 1);
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.l_rgb2hsv(L: lua.State): cint; cdecl;
+	var
+		rgb: Vec3;
+		vArgs: uint;
+	begin
+		rgb := ArgVec3(L, 1, vArgs, 'rgb2hsv');
+		result := PushArgVec3(L, RGBToHSV(rgb), vArgs > 1);
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.SelfToImage(L: lua.State; const func: string): pImage;
+	var
+		top: cint;
+	begin
+		top := lua.gettop(L);
+		lua.rawgeti(L, lua.REGISTRYINDEX, Reg_ImageMT);
+		if (lua.getmetatable(L, 1) = 0) or not lua.rawequal(L, -2, -1) then ArgError(L, func, 1, 1, top, 'где self? пропущена «:»?');
+		lua.settop(L, top);
+		result := SelfToImageUnchecked(L);
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.SelfToImageUnchecked(L: lua.State): pImage;
+	begin
+		result := pPointer(lua.touserdata(L, 1))^;
+	end;
+
+	class function GenerateByScriptOperation.ScriptState.MaybePixelPtr(var im: Image; const v: Vec2): pointer;
+	begin
+		if (v.x >= 0) and (v.x < im.w) and (v.y >= 0) and (v.y < im.h) then
+			result := im.data + im.format.pixelSize * (im.w * trunc(v.y) + trunc(v.x))
+		else
+			result := nil;
+	end;
+
+{$define lookupf :=
+	class function GenerateByScriptOperation.ScriptState.lookupfunc(var im: Image; const v: Vec2): storagetype;
+	var
+		p: pointer;
+	begin
+		p := MaybePixelPtr(im, v);
+		if Assigned(p) then result := Image.imagereadfunc(p, im.format) else result := storagedefault;
+	end;} all_script_lookups
+
+	class function GenerateByScriptOperation.ScriptState.l_image_index(L: lua.State): cint; cdecl;
+	var
+		p: pChar;
+		im: pImage;
+	begin
+		p := lua.topchar(L, 2);
+		result := 0;
+		if Assigned(p) then
+			case p[0] of
+				'r':
+					if (p[1] = 'g') and (p[2] = 'b') then
+						case p[3] of
+							#0: begin lua.pushcfunction(L, lua.CFunction(@ScriptState.l_image_rgb)); result := 1; end;
+							'a': if p[4] = #0 then begin lua.pushcfunction(L, lua.CFunction(@ScriptState.l_image_rgba)); result := 1; end;
+						end;
+				'g':
+					case p[1] of
+						#0: begin lua.pushcfunction(L, lua.CFunction(@ScriptState.l_image_g)); result := 1; end;
+						'a': if p[2] = #0 then begin lua.pushcfunction(L, lua.CFunction(@ScriptState.l_image_ga)); result := 1; end;
+					end;
+				'w':
+					case p[1] of
+						'h': if p[2] = #0 then begin im := SelfToImageUnchecked(L); PushVec2(L, Vec2.Make(im^.w, im^.h)); result := 1; end;
+					end;
+				'h': if p[1] = #0 then begin lua.pushnumber(L, SelfToImageUnchecked(L)^.h); result := 1; end;
+			end;
+		if result = 0 then lua.throw(L, 'image.{}'.Format([HumanValue(L, 2)]));
+	end;
+
+{$define lookupf :=
+	class function GenerateByScriptOperation.ScriptState.bindinglookupfunc(L: lua.State): cint; cdecl;
+	var
+		vArgs: uint;
+		v: Vec2;
+	begin
+		v := ArgVec2(L, 2, vArgs, 'image::' + scriptlookupname);
+		result := {$if chans = 1} 1; lua.pushnumber {$elseif chans = 2} PushArgVec2 {$elseif chans = 3} PushArgVec3 {$else} PushArgVec4 {$endif} (L,
+			lookupfunc(SelfToImage(L, 'image::' + scriptlookupname)^, v)
+			{$if chans > 1}, vArgs > 1 {$endif});
+	end;} all_script_lookups
+
+type
+	Application = object
+		ir: ImageRegistry;
+		tasks: array of GenericOp;
+		lastSpec: ImageSpec;
+		repl: boolean;
+
+		procedure Init;
+		procedure Done;
+		function Execute(const input: string): boolean;
+	end;
+
+	procedure Application.Init;
+	begin
+		try
+			lodepng.Load('{}lib\{}\lodepng.dll'.Format([Executable.Path, CPUArch]));
+			lua.Load('{}lib\{}\lua.dll'.Format([Executable.Path, CPUArch]));
+			ir.Init;
+			lastSpec := ImageSpec.Make(768, 768, 1, ImageFormat.RGB);
+		except
+			Done;
+			raise;
+		end;
+	end;
+
+	procedure Application.Done;
+	var
+		i: SizeInt;
+	begin
+		for i := 0 to High(tasks) do tasks[i].Free(tasks[i]);
+		tasks := nil;
+		ir.Done;
+		lua.Unload;
+		lodepng.Unload;
+	end;
+
+	function Application.Execute(const input: string): boolean;
+	begin
+		result := true;
 	end;
 
 var
-	ir: ImageRegistry;
-	op: GenericOp;
-	pl: GenerateByFormulaOperation;
-	t: ticks;
+	app: Application;
+	input: string;
 
 begin
 	try
 		try
-			lodepng.Load('{}lib\{}\lodepng.dll'.Format([ExecRoot, CPUArch]));
-			lua.Load('{}lib\{}\lua.dll'.Format([ExecRoot, CPUArch]));
-			try
-				ir.Init;
-				pl := GenerateByFormulaOperation.Create;
-				pl.getPixel := @GetPixel;
-				pl.param := pl;
-				pl.w := 2048;
-				pl.h := 2048;
-				pl.frames := 1;
-				pl.format := ImageFormat.RGBA;
-				op := GenericOp.Create(ir, @pl);
-				op.oname := ImageName.Parse('result%f%.png');
-				t := ticks.get;
-				op.Run;
-				op.lock.Enter;
-				try
-					while (op.stat = op.Status.Running) do op.hey.Wait(op.lock);
-				finally
-					op.lock.Leave;
+			app.Init;
+			input := Win32.CommandLineTail;
+			app.repl := input = '';
+			if app.repl then Con.ColoredLine('<gb>Справка: ?');
+			repeat
+				if app.repl then
+				begin
+					Con.Colored('<.3>> ');
+					input := Con.ReadLine;
 				end;
-				t := ticks.get-t;
-				Con.ResetCtrlC;
-				writeln(seconds(t):0:2);
-				if op.stat = op.Status.Completed then
-					Con.ColoredLine('<g>OK!')
-				else
-				if op.stat = op.Status.Cancelled then
-					Con.ColoredLine('<gb>Операция прервана.')
-				else
-					Con.ColoredLine('<R>' + Con.Escape(IfThen(op.err <> '', op.err, 'Что-то не так.')));
-			finally
-				pl.Free(pl);
-				op.Free(op);
-				ir.Done;
-			end;
-		finally
-			lua.Unload;
-			lodepng.Unload;
+			until not app.Execute(input) or not app.repl;
+		except
+			Con.ResetCtrlC;
+			if Exception.Current is Interception then
+				if app.repl then begin Con.Colored('<gb>' + Exception.Message); if app.repl then Con.ReadLine; end else
+			else begin Con.Colored('<R>' + Con.Escape(Exception.Message)); if app.repl then Con.ReadLine; end;
 		end;
-	except
-		on e: Interception do begin Con.ResetCtrlC; Con.Colored('<R>Выполнение прервано.'); end;
+	finally
+		app.Done;
 	end;
-	Con.ReadLine;
 end.
