@@ -39,9 +39,9 @@ uses
 
 // unchecked
 // ...код, сознательно использующий целочисленные переполнения
-// _end
-{$define unchecked := {$if defined(_end)} {$error unchecked would hide defines} {$endif}
-	{$push} {$rangechecks off} {$overflowchecks off} {$define _end := {$pop} {$undef _end}}}
+// end_unchecked
+{$define unchecked := {$if defined(end_unchecked)} {$error unchecked would hide defines} {$endif}
+	{$push} {$rangechecks off} {$overflowchecks off} {$define end_unchecked := {$pop} {$undef end_unchecked}}}
 
 // шаблон для векторов
 {$define all_vectors :=
@@ -149,6 +149,12 @@ type
 	begin
 		t := clamp((x - a) / (b - a), 0, 1);
 		result := t * t * (3 - 2*t);
+	end;
+
+	function floor(const x: typename): typename;
+	begin
+		result := int(x);
+		if (x < 0) and (frac(x) < 0) then result -= 1;
 	end;
 {$endif}
 
@@ -338,7 +344,7 @@ type
 	private class var
 		ifreq: double;
 	end;
-	operator -(const a, b: Ticks): Ticks; begin unchecked result.internal := (a.internal - b.internal); _end Assert(result.internal >= 0); end;
+	operator -(const a, b: Ticks): Ticks; begin unchecked result.internal := (a.internal - b.internal); end_unchecked Assert(result.internal >= 0); end;
 	operator :=(const t: Ticks): seconds; begin result := t.internal * Ticks.ifreq; end;
 
 type
@@ -498,6 +504,7 @@ type
 		ColorNames: array[Color] of string = ('0', 'r', 'g', 'rg', 'b', 'rb', 'gb', '.3', '.6', 'R', 'G', 'RG', 'B', 'RB', 'GB', '1');
 		MinCtrlCsForHardShutdown = 3;
 		CtrlCPeriod = seconds(1.4);
+		CR = #13;
 	strict private const
 		// Биты CONSOLE_SCREEN_BUFFER_INFO.wAttributes.
 		BitsToColor: array[0 .. 15] of Color = (Black, Navy, Green, Teal, Maroon, Purple, Olive, Gray, Silver, Blue, Lime, Aqua, Red, Fuchsia, Yellow, White);
@@ -669,10 +676,13 @@ type
 	{$define one :=
 		function func(const syms: CharSet; p: SizeInt {$ifdef rbool}; out np: SizeInt {$endif}): {$ifdef rbool} boolean {$else} SizeInt {$endif};}
 		all_string_helper_consume_functions
+		function Consume(const what: string; p: SizeInt; out np: SizeInt): boolean;
 
 		function Find(const sample: string; start: SizeInt = 1): SizeInt;
 		function FindRev(const sample: string; start: SizeInt = High(SizeInt)): SizeInt;
 		function Quote: string;
+		function PadLeft(len: SizeInt): string;
+		class function Dup(ch: char; count: SizeInt): string; static;
 
 	type
 		ReplaceFunction = function(const src, sample: string; pos: SizeInt; param: pointer): string;
@@ -1440,7 +1450,7 @@ var
 		try
 			data := '';
 			// Я, наверное, что-то делаю не так, потому что у меня после WriteConsoleInput первая (и только первая) ReadConsole возвращает мусор.
-			if not ReadConsoleW(hIn, nil, 0, (@got)^, nil) then raise Win32.OperationFailed('выполнить фиктивное чтение с консоли (ReadConsole)', GetLastError);
+			// if not ReadConsoleW(hIn, nil, 0, (@got)^, nil) then raise Win32.OperationFailed('выполнить фиктивное чтение с консоли (ReadConsole)', GetLastError);
 			Intercept;
 
 			repeat
@@ -1557,7 +1567,7 @@ var
 			inp: array of INPUT_RECORD;
 			written: dword;
 		begin
-			hey := #13;
+			hey := CR;
 			SetLength(inp, 2 * length(hey));
 			for i := 0 to High(inp) do
 			begin
@@ -2369,6 +2379,13 @@ var
 	end;}
 	all_string_helper_consume_functions
 
+	function StringHelper.Consume(const what: string; p: SizeInt; out np: SizeInt): boolean;
+	begin
+		np := p;
+		result := Prefixed(what, p);
+		if result then np += length(what);
+	end;
+
 	function StringHelper.Find(const sample: string; start: SizeInt = 1): SizeInt;
 	var
 		i: SizeInt;
@@ -2398,6 +2415,20 @@ var
 		for i := 0 to High(Variants) do
 			if (i = High(Variants)) or (Find(Variants[i, 0]) = 0) and ((Variants[i, 1] = Variants[i, 0]) or (Find(Variants[i, 1]) = 0)) then
 				exit(Variants[i, 0] + self + Variants[i, 1]);
+	end;
+
+	function StringHelper.PadLeft(len: SizeInt): string;
+	begin
+		result := Dup(' ', len - length(self)) + self;
+	end;
+
+	class function StringHelper.Dup(ch: char; count: SizeInt): string;
+	begin
+		if count <= 0 then exit('') else
+		begin
+			SetLength(result, count);
+			FillChar(result[1], count, ch);
+		end;
 	end;
 
 	function StringHelper.Replace(const sample: string; repl: ReplaceFunction; param: pointer): string;
@@ -2641,7 +2672,7 @@ var
 			if fatal then Con.StickToCurrentThread;
 			Con.ResetCtrlC;
 			Con.Colored(Con.Escape(msg), Con.Red);
-			Con.ReadLine;
+			readln;
 		end else
 		begin
 			writeln(stderr, msg.ToUTF16);
@@ -2670,6 +2701,7 @@ var
 			if not (Obj is SpecialException) then msg += HumanTrace(Frame, FrameCount);
 			PrintError(msg, true);
 		end;
+		raise Exception.Create('test');
 
 		// А этот хак настолько грязный, что нельзя легко проверить его состоятельность при недокументированных изменениях в RTL
 		// (к счастью, всегда есть альтернатива: не заморачиваться и сделать сеппуку aka TerminateProcess). Дело вот в чём.
@@ -3453,7 +3485,7 @@ type
 							if result.insertFrameNoAt = 0 then
 							begin
 								if nn.Prefixed('f%', i + 1) then len := length('%f%')
-								else if nn.Prefixed('frame%', i + 1) then len := length('%frame')
+								else if nn.Prefixed('frame%', i + 1) then len := length('%frame%')
 								else len := 0;
 
 								if len > 0 then
@@ -3559,13 +3591,22 @@ type
 	end;
 
 	procedure ImageRegistry.Add(item: pItem; const name: string);
+	var
+		i: SizeInt;
+		oldItem: pItem;
 	begin
 		lck.Enter;
 		try
-			if nItems >= length(items) then SetLength(items, Ary.GrowStgy(nItems + 1, length(items)));
-			inc(nItems);
-			items[nItems - 1].item := item^.Ref;
-			items[nItems - 1].name := name;
+			i := UnlockedFind(name);
+			if i < 0 then
+			begin
+				i := nItems;
+				inc(nItems); if nItems > length(items) then SetLength(items, Ary.GrowStgy(nItems, length(items)));
+			end;
+			oldItem := items[i].item;
+			items[i].item := item^.Ref;
+			items[i].name := name;
+			oldItem^.Release(oldItem);
 		finally
 			lck.Leave;
 		end;
@@ -3625,6 +3666,9 @@ type
 	GenericOpPayload = class(TObjectEx)
 		op: GenericOp;
 		oim: Image;
+		oimCompletedInStart: boolean;
+		oimTakenFrom: ImageRegistry.pItem;
+		constructor Create;
 		destructor Destroy; override;
 		procedure Start; virtual;
 		procedure GeneratePart(threadIndex, startPixel, endPixel: SizeUint); virtual;
@@ -3738,9 +3782,19 @@ type
 		procedure MaybeComplete;
 	end;
 
+	constructor GenericOpPayload.Create;
+	begin
+		inherited Create;
+	end;
+
 	destructor GenericOpPayload.Destroy;
 	begin
-		oim.Done;
+		if Assigned(oimTakenFrom) then
+		begin
+			oim.Invalidate;
+			oimTakenFrom^.Release(oimTakenFrom);
+		end else
+			oim.Done;
 		inherited Destroy;
 	end;
 
@@ -3829,7 +3883,7 @@ type
 							if not inputs[i].onlyRead then
 								case FilePath(inputs[i].name.name).Extension.Lowercase of
 									'png': ;
-									else raise Exception.Create('{}: неизвестный формат.'.Format([inputs[i].name.name]));
+									else raise Exception.Create('{}: неизвестный формат.'.Format([inputs[i].name.orig]));
 								end;
 
 							lock.Enter;
@@ -3894,7 +3948,7 @@ type
 	begin
 		if lock then self.lock.Enter else Assert(self.lock.AcquiredAssert);
 		try
-			if stat <> Status.Running then raise Interception.Create('Операция прервана.');
+			if not (stat in [Status.Running, Status.Completed]) then raise Interception.Create('Операция прервана.');
 		finally
 			if lock then self.lock.Leave;
 		end;
@@ -3913,13 +3967,13 @@ type
 	function GenericOp.Progress: float;
 		function OnceRead: float;
 		begin
-			if Ary(fileInputs).Empty then result := 0 else result := 0.1;
+			if Ary(fileInputs).Empty then result := 0 else result := 0.05;
 		end;
 
 		function SingleReadingProgress(const inp: InputRec): float;
 		const
-			WhenReading = 0.05;
-			OnceRead = 0.1;
+			WhenReading = 0.01;
+			OnceRead = 0.02;
 		begin
 			case inp.stage of
 				InputStage.Reading: result := WhenReading;
@@ -3950,7 +4004,9 @@ type
 
 		function OnceProcessed: float;
 		begin
-			if oname.mode = oname.Alias then result := 1 else result := 0.6;
+			if oname.mode = oname.Alias then result := 1 else
+				if pl.oimCompletedInStart then result := onceRead else
+					result := 0.5;
 		end;
 
 		function SingleSavingProgress(const outp: OutputRec): float;
@@ -4176,7 +4232,7 @@ type
 				Intercept;
 				case FilePath(inp.name.name).Extension.Lowercase of
 					'png': DecodePNG(inp);
-					else raise Exception.Create('{}: неизвестный формат.'.Format([inp.name.name]));
+					else raise Exception.Create('{}: неизвестный формат.'.Format([inp.name.orig]));
 				end;
 				FreeMem(inp.data);
 
@@ -4261,9 +4317,9 @@ type
 		decodedData, decodedBlock: pointer;
 
 	begin
-		if inp.dataSize < IHDR_offset + sizeof(((@ihdr)^^)) then raise Exception.Create('Файл повреждён.'.Format([inp.dataSize]));
+		if inp.dataSize < IHDR_offset + sizeof(((@ihdr)^^)) then raise Exception.Create('{}: файл повреждён.'.Format([inp.name.orig]));
 		ihdr := inp.data + IHDR_offset;
-		if ihdr^.asChunk.chunktype <> 'IHDR' then raise Exception.Create('Неверный заголовок PNG.');
+		if ihdr^.asChunk.chunktype <> 'IHDR' then raise Exception.Create('{}: неверный заголовок PNG.'.Format([inp.name.orig]));
 
 		if RGB_BIT and ihdr^.colorType <> 0 then
 			if (ALPHA_BIT and ihdr^.colorType <> 0) or ((ihdr^.colorType and PLTE_BIT <> 0) and has_tRNS(@ihdr^.asChunk, inp.dataSize - IHDR_offset)) then
@@ -4282,7 +4338,7 @@ type
 			lodepng.island.Purge(ThreadID);
 			raise;
 		end;
-		if lcode <> 0 then raise Exception.Create(lodepng.ErrorMessage(lcode));
+		if lcode <> 0 then raise Exception.Create(inp.name.orig + ': ' + lodepng.ErrorMessage(lcode));
 		lodepng.island.TakeAway(decodedData, decodedBlock);
 
 		try
@@ -4322,7 +4378,7 @@ type
 			lock.Enter;
 		end;
 		Intercept(false);
-		if Assigned(pl.oim.data) then
+		if Assigned(pl.oim.data) and not pl.oimCompletedInStart then
 		begin
 			pixels := SizeUint(pl.oim.w) * pl.oim.h * pl.oim.frames;
 			partSize := pixels div CodingThreads;
@@ -4398,6 +4454,9 @@ type
 			if (frame < 0) and (pl.oim.frames > 1) then
 				case oname.mode of
 					ImageName.Alias:
+						if Assigned(pl.oimTakenFrom) then
+							ir^.Add(pl.oimTakenFrom, name)
+						else
 						begin
 							im := ImageRegistry.Item.Create;
 							try
@@ -4420,10 +4479,21 @@ type
 
 				case oname.mode of
 					ImageName.Alias:
+						if Assigned(pl.oimTakenFrom) and (pl.oim.frames = 1) then
+							ir^.Add(pl.oimTakenFrom, name)
+						else
 						begin
 							im := ImageRegistry.Item.Create;
 							try
-								im^.im.Init(name, nil, ImageSpec.Make(pl.oim.w, pl.oim.h, 1, pl.oim.format));
+								if (pl.oim.frames = 1) and not Assigned(pl.oimTakenFrom) then
+								begin
+									im^.im := pl.oim; pl.oim.Invalidate;
+								end else
+								begin
+									im^.im.Init(name, nil, ImageSpec.Make(pl.oim.w, pl.oim.h, 1, pl.oim.format));
+									Move((pl.oim.data + pl.oim.format.pixelSize * pl.oim.w * pl.oim.h * SizeUint(frame))^,
+										im^.im.data^, pl.oim.format.pixelSize * pl.oim.w * pl.oim.h);
+								end;
 								ir^.Add(im, name);
 							finally
 								im^.Release(im);
@@ -4537,6 +4607,7 @@ type
 
 				lock.Enter;
 				try
+					Intercept(false);
 					outp.stage := OutputStage.Writing;
 					outp.startedAt := Ticks.Get;
 					dec(encoding);
@@ -4607,6 +4678,7 @@ type
 						end else
 							raise status.ToException;
 					outp.f.Close;
+					FreeMem(outp.dataBlock); outp.data := nil;
 					outp.stage := OutputStage.Completed;
 					dec(pendingOutputs);
 					MaybeComplete;
@@ -4742,7 +4814,7 @@ type
 	procedure TweenOperation.Start;
 	var
 		spec: ImageSpec;
-		frames: SizeUint;
+		frames, oframes: SizeUint;
 		i: SizeInt;
 	begin
 		if length(op.inputs) <= 1 then
@@ -4750,8 +4822,13 @@ type
 		if length(inps) + 1 <> length(op.inputs) then
 			raise Exception.Create('Неверно заданы переходы: ожидается {}-1, получено {}.'.Format([length(op.inputs), length(inps)]));
 		MixOperation.ChooseOutputSpec(op, spec);
-		frames := 1;
-		for i := 0 to High(inps) do frames += 1 + inps[i].extraFrames;
+
+		frames := 1; oframes := frames;
+		for i := 0 to High(inps) do
+		begin
+			unchecked frames += 1; end_unchecked if frames < oframes then raise Exception.Create('Слишком много кадров.'); oframes := frames;
+			unchecked frames += inps[i].extraFrames; end_unchecked if frames < oframes then raise Exception.Create('Слишком много кадров.'); oframes := frames;
+		end;
 		oim.Init(op.oname.name, nil, ImageSpec.Make(spec.w, spec.h, frames, spec.format));
 	end;
 
@@ -5313,7 +5390,7 @@ type
 
 	type
 		ScriptState = class(TObjectEx)
-			L: lua.State; // userparamptr^ = @self
+			L: lua.State; // userparamptr^ = self
 			op: GenerateByScriptOperation;
 			x, y, f: SizeUint;
 			intercepted: boolean;
@@ -5351,6 +5428,7 @@ type
 			class function l_sin(L: lua.State): cint; cdecl; static;
 			class function l_cos(L: lua.State): cint; cdecl; static;
 			class function l_smoothstep(L: lua.State): cint; cdecl; static;
+			class function l_floor(L: lua.State): cint; cdecl; static;
 			class function l_hsv2rgb(L: lua.State): cint; cdecl; static;
 			class function l_rgb2hsv(L: lua.State): cint; cdecl; static;
 			class function SelfToImage(L: lua.State; const func: string): pImage; static;
@@ -5396,12 +5474,9 @@ type
 			spec.w := op.inputs[0].im^.im.w;
 			spec.h := op.inputs[0].im^.im.h;
 		end;
-
 		oim.spec := spec;
 
-		ss0 := ScriptState.Create(self);
 		if chunkName = '' then chunkName := source + EOL;
-
 		// Lua отрежет название, если оно слишком длинное. Сделать это самому, красивее.
 		if length(chunkName) > lua.IDSIZE - 10 then
 		begin
@@ -5414,6 +5489,7 @@ type
 			chunkName := chunkName.Head(acceptLen) + '(...)' + IfThen(chunkName.ConsumeRev([#13, #10], length(chunkName)) < length(chunkName), EOL);
 		end;
 
+		ss0 := ScriptState.Create(self);
 		try
 			lua.loadstringE(ss0.L, [source], chunkName);
 		except
@@ -5435,10 +5511,6 @@ type
 	end;
 
 	procedure GenerateByScriptOperation.GeneratePart(threadIndex, startPixel, endPixel: SizeUint);
-		function Mismatch(nc: uint): Exception;
-		begin
-			result := Exception.Create('Формула вернула {} значени{е/я/й}, ожидается 1-4.'.Format([VarRec.uint(nc), oim.format.id]));
-		end;
 	var
 		ss: ScriptState;
 		pixel, psz: SizeUint;
@@ -5497,13 +5569,15 @@ type
 	// на вершине стека ожидается функция; она НЕ снимается со стека
 	function GenerateByScriptOperation.ScriptState.CallGetPixel(var r: Vec4): uint;
 	var
-		top, first, nr, i: cint;
+		top, first, i: cint;
+		nv, vi: uint;
+		v: pointer;
 	begin
 		top := lua.gettop(L);
 		lua.pushvalue(L, -1); // (top)func func
 		if lua.pcall(L, 0, lua.MULTRET, 0) <> lua.OK then
 		begin
-			// Lua-хук, чтобы не бросать исключение сквозь Lua-фреймы, преобразует его lua_error с простым сообщением об ошибке, т. е. тип теряется.
+			// Lua-хук, чтобы не бросать исключение сквозь Lua-фреймы, преобразует его в lua_error с простым сообщением об ошибке, т. е. тип теряется.
 			// Для Interception он запоминается ad-hoc, чтобы отличить эту ситуацию.
 			if intercepted then op.op.Intercept;
 			raise Exception.Create(lua.striplinenumber(lua.tostring(L, -1), op.chunkName));
@@ -5511,36 +5585,30 @@ type
 		first := top + 1;
 		// func (first)...результаты...
 
-		nr := lua.gettop(L) - top;
-		case nr of
-			1:
-				case lua.&type(L, first) of
-					lua.TNUMBER: // градация серого
-						begin
-							r.data[0] := lua.tonumberx(L, first, nil);
-							result := 1;
-						end;
-					lua.TUSERDATA: // вектор
-						case VecLen(L, first) of
-							2: begin pVec2(@r)^ := pVec2(lua.touserdata(L, first))^; result := 2; end;
-							3: begin pVec3(@r)^ := pVec3(lua.touserdata(L, first))^; result := 3; end;
-							4: begin r := pVec4(lua.touserdata(L, first))^; result := 4; end;
-							else result := 0;
-						end;
-					else result := 0;
-				end;
-			2, 3, 4: // вектор как N чисел.
-				begin
-					result := nr;
-					for i := first to first + nr - 1 do
-						if lua.&type(L, i) = lua.TNUMBER then r.data[i-first] := lua.tonumberx(L, i, nil) else result := 0;
-				end;
-			else result := 0;
-		end;
+		result := 0;
+		for i := first to lua.gettop(L) do
+			case lua.&type(L, i) of
+				lua.TNUMBER:
+					begin
+						if result + 1 > length(r.data) then begin result := 0; break; end;
+						r.data[result] := lua.tonumberx(L, i, nil);
+						inc(result);
+					end;
+				lua.TUSERDATA:
+					begin
+						nv := VecLen(L, i);
+						if (nv = 0) or (result + nv > length(r.data)) then begin result := 0; break; end;
+						v := lua.touserdata(L, i);
+						for vi := 0 to nv - 1 do
+							r.data[result + vi] := pVec4(v)^.data[vi];
+						result += nv;
+					end;
+				else begin result := 0; break; end
+			end;
 
 		if result = 0 then
-			raise Exception.Create('Формула {}; ожидается 1 вектор или от 1 до 4 чисел.'.Format([
-				IfThen(nr > 0, 'вернула ({})'.Format([HumanArgs(L, first, first + nr - 1)]), 'ничего не вернула')]));
+			raise Exception.Create('Формула {}, а должна 1–4 числа.'.Format([
+				IfThen(lua.gettop(L) > first, 'вернула ({})'.Format([HumanArgs(L, first, lua.gettop(L))]), 'ничего не вернула')]));
 		lua.settop(L, top);
 	end;
 
@@ -5578,6 +5646,7 @@ type
 			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_sin)); lua.setfield(L, -2, 'sin');
 			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_cos)); lua.setfield(L, -2, 'cos');
 			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_smoothstep)); lua.setfield(L, -2, 'smoothstep');
+			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_floor)); lua.setfield(L, -2, 'floor');
 			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_hsv2rgb)); lua.setfield(L, -2, 'hsv2rgb');
 			lua.pushcfunction(L, lua.CFunction(@ScriptState.l_rgb2hsv)); lua.setfield(L, -2, 'rgb2hsv');
 			for i := 0 to High(op.op.inputs) do
@@ -6122,6 +6191,7 @@ type
 	class function GenerateByScriptOperation.ScriptState.l_sin(L: lua.State): cint; cdecl; {$define funcname := 'sin'} {$define func := sin} {$define per_component} opimpl
 	class function GenerateByScriptOperation.ScriptState.l_cos(L: lua.State): cint; cdecl; {$define funcname := 'cos'} {$define func := cos} {$define per_component} opimpl
 	class function GenerateByScriptOperation.ScriptState.l_smoothstep(L: lua.State): cint; cdecl; {$define funcname := 'smoothstep'} {$define func := smoothstep} {$define x_erp} opimpl
+	class function GenerateByScriptOperation.ScriptState.l_floor(L: lua.State): cint; cdecl; {$define funcname := 'floor'} {$define func := floor} {$define per_component} opimpl
 {$undef opimpl}
 
 	class function GenerateByScriptOperation.ScriptState.l_hsv2rgb(L: lua.State): cint; cdecl;
@@ -6197,6 +6267,7 @@ type
 					end;
 				'w':
 					case p[1] of
+						#0: begin lua.pushnumber(L, SelfToImageUnchecked(L)^.w); result := 1; end;
 						'h': if p[2] = #0 then begin im := SelfToImageUnchecked(L); PushVec2(L, Vec2.Make(im^.w, im^.h)); result := 1; end;
 					end;
 				'h': if p[1] = #0 then begin lua.pushnumber(L, SelfToImageUnchecked(L)^.h); result := 1; end;
@@ -6217,15 +6288,59 @@ type
 	end;} all_script_lookups
 
 type
+	LoadSaveOperation = class(GenericOpPayload)
+		destructor Destroy; override;
+		procedure Start; override;
+	end;
+
+	destructor LoadSaveOperation.Destroy;
+	begin
+		inherited Destroy;
+	end;
+
+	procedure LoadSaveOperation.Start;
+	begin
+		if length(op.inputs) <> 1 then
+			raise Exception.Create('На входе {} файл{/а/ов}; нужен 1.'.Format([length(op.inputs)]));
+		if not Assigned(op.inputs[0].im) then raise Exception.Create('{}: нет картинки.'.Format([op.inputs[0].name.orig]));
+		oimTakenFrom := op.inputs[0].im^.Ref;
+		oim := oimTakenFrom^.im;
+		oimCompletedInStart := true;
+	end;
+
+type
 	Application = object
+	type
+		HowProgressDrawn = (ItsNot, OnlyNumber, Bar);
+	var
 		ir: ImageRegistry;
 		tasks: array of GenericOp;
-		lastSpec: ImageSpec;
+		lastSpec, newLastSpec: ImageSpec;
 		repl: boolean;
+		startedAt: Ticks;
+		progressDrawn: HowProgressDrawn;
 
 		procedure Init;
 		procedure Done;
 		function Execute(const input: string): boolean;
+	private const
+		ShowProgressAfterMs = 300;
+		ProgressUpdatePeriodMs = 150;
+		MinProgressBarSize = 30;
+		ProgressBarRightMargin = 1;
+	type
+		ShowHelp = class(Exception) end;
+		procedure MaybeRedrawProgress(currentTask: SizeInt);
+		procedure EraseProgress;
+		procedure Parse(const input: string);
+		function MaybeSkipIgnoreCase(const input, what: string; p: SizeInt; out np: SizeInt): boolean;
+		procedure ParseMix(const input: string; p: SizeInt; out np: SizeInt);
+		function ParseImageName(out im: ImageName; const input: string; p: SizeInt; out np: SizeInt): boolean;
+		procedure ParseTween(const input: string; p: SizeInt; out np: SizeInt);
+		function ParseLoadSave(const input: string; p: SizeInt; out np: SizeInt): boolean;
+		procedure ParseGen(const input: string; p: SizeInt; out np: SizeInt; explicit: boolean);
+		function ParseSize(const input: string; p: SizeInt; out np: SizeInt; out spec: ImageSpec; out sizeSet, formatSet: boolean): boolean;
+		procedure ParseExpr(const input: string; p: SizeInt; out np: SizeInt; out source: string);
 	end;
 
 	procedure Application.Init;
@@ -6242,19 +6357,611 @@ type
 	end;
 
 	procedure Application.Done;
-	var
-		i: SizeInt;
 	begin
-		for i := 0 to High(tasks) do tasks[i].Free(tasks[i]);
-		tasks := nil;
 		ir.Done;
 		lua.Unload;
 		lodepng.Unload;
 	end;
 
 	function Application.Execute(const input: string): boolean;
+	var
+		i: SizeInt;
 	begin
+		try
+			try
+				newLastSpec := lastSpec;
+				Parse(input);
+				startedAt := Ticks.Get;
+				progressDrawn := HowProgressDrawn.ItsNot;
+				try
+					for i := 0 to High(tasks) do
+					begin
+						tasks[i].Run;
+						tasks[i].lock.Enter;
+						try
+							while tasks[i].stat = tasks[i].Status.Running do
+							begin
+								MaybeRedrawProgress(i);
+								tasks[i].hey.Wait(tasks[i].lock, ProgressUpdatePeriodMs);
+							end;
+						finally
+							tasks[i].lock.Leave;
+						end;
+						case tasks[i].stat of
+							tasks[i].Status.Completed: ;
+							tasks[i].Status.Cancelled: begin Con.ResetCtrlC; raise Interception.Create('Операция прервана.'); end;
+							else raise Exception.Create(IfThen(tasks[i].err <> '', tasks[i].err, 'Что-то не так (и нет сообщения ооб ошибке).'));
+						end;
+					end;
+					lastSpec := newLastSpec;
+				finally
+					EraseProgress;
+				end;
+				if not Ary(tasks).Empty then Con.ColoredLine('<G>Сделано.' + IfThen(repl, EOL));
+			except
+				on e: ShowHelp do Con.ColoredLine('<gb>' + e.msg.Replace('(E) ', IfThen(repl, '', '<1>' + Executable.FilenameWoExt + '</> ')) + IfThen(repl, EOL));
+				on e: Interception do Con.ColoredLine('<gb>' + Exception.Message + IfThen(repl, EOL));
+				else Con.ColoredLine('<R>' + Con.Escape(Exception.Message) + IfThen(repl, EOL));
+			end;
+			result := true;
+		finally
+			for i := 0 to High(tasks) do tasks[i].Free(tasks[i]);
+			tasks := nil;
+		end;
+	end;
+
+	procedure Application.MaybeRedrawProgress(currentTask: SizeInt);
+	var
+		value: float;
+		v: string;
+		barSize, cplSize, sumEdges, width: SizeUint;
+	begin
+		if (progressDrawn = HowProgressDrawn.ItsNot) and (seconds(Ticks.Get - startedAt) < ShowProgressAfterMs / 1000) then exit;
+		value := clamp(currentTask / length(tasks) + (1 / length(tasks)) * tasks[currentTask].Progress, 0, 1);
+		str(value*100:3:1, v);
+		if length(v) > 5 then v := '???';
+		v := (v + '%').PadLeft(7);
+		sumEdges := SizeUint(length(v)) + SizeUint(length(' [')) + SizeUint(length(']')) + ProgressBarRightMargin;
+		width := Con.Width;
+		if sumEdges + MinProgressBarSize >= width then
+		begin
+			if (progressDrawn <> HowProgressDrawn.OnlyNumber) or (uint(length(v)) + ProgressBarRightMargin >= width) then EraseProgress;
+			if uint(length(v)) + ProgressBarRightMargin >= width then exit;
+			Con.Colored(Con.CR + '<.3>' + v);
+			progressDrawn := HowProgressDrawn.OnlyNumber;
+			exit;
+		end;
+		barSize := max(2 * (width - sumEdges) div 3, MinProgressBarSize);
+		cplSize := clamp(trunc(barSize * value), 0, barSize);
+		Con.Colored(Con.CR + '<.3>' + v + ' <gb>[<gb>' + ''.Dup('#', cplSize) + ''.Dup('.', barSize - cplSize) + '</>]');
+		progressDrawn := HowProgressDrawn.Bar;
+	end;
+
+	procedure Application.EraseProgress;
+	begin
+		if progressDrawn <> HowProgressDrawn.ItsNot then
+		begin
+			Con.Write(Con.CR + ''.Dup(' ', Con.Width - min(Con.Width, max(1, ProgressBarRightMargin))) + Con.CR);
+			progressDrawn := HowProgressDrawn.ItsNot;
+		end;
+	end;
+
+	procedure Application.Parse(const input: string);
+	var
+		p, p2, p3: SizeInt;
+	begin
+		p := input.Consume(StringHelper.AsciiSpaces, 1);
+		if repl and (MaybeSkipIgnoreCase(input, Executable.Filename, p, p2) or MaybeSkipIgnoreCase(input, Executable.FilenameWoExt, p, p2)) then
+			p := p2;
+
+		while p <= length(input) do
+		begin
+			input.Consume(StringHelper.AsciiSpaces, p, p);
+			if input.Consume('mix', p, p2) and (input.Consume(StringHelper.AsciiSpaces + ['?'], p2, p3) or (p3 > length(input))) then ParseMix(input, p2, p)
+			else if input.Consume('tween', p, p2) and (input.Consume(StringHelper.AsciiSpaces + ['?'], p2, p3) or (p3 > length(input))) then ParseTween(input, p2, p)
+			else if input.Consume('gen', p, p2) and (input.Consume(StringHelper.AsciiSpaces + ['?'], p2, p3) or (p3 > length(input))) then ParseGen(input, p2, p, true)
+			else if input.Prefixed('?', p) then
+				raise ShowHelp.Create(
+					'    (E) <1>mix</>   — смешивание изображений' + EOL +
+					'    (E) <1>tween</> — переходы между изображениями' + EOL +
+					'    (E) <1>gen</>   — процедурная генерация')
+			else if ParseLoadSave(input, p, p) then
+			else if p <= length(input) then ParseGen(input, p, p, false);
+
+			input.Consume(StringHelper.AsciiSpaces, p, p2);
+			if not input.Consume(',', p2, p3) and (p3 <= length(input)) then
+				raise Exception.Create('{}...: отделите предыдущую команду запятой.'.Format([input.Head(p - 1)]));
+			p := p3;
+		end;
+	end;
+
+	function Application.MaybeSkipIgnoreCase(const input, what: string; p: SizeInt; out np: SizeInt): boolean;
+	var
+		dp, pw, dpw: SizeInt;
+	begin
+		pw := 1;
+		while (input.Peek(p, dp) <> StringHelper.UTFInvalid) and (what.Peek(pw, dpw) <> StringHelper.UTFInvalid) do
+		begin
+			if input.AB(p, p + dp).Lowercase <> what.AB(pw, pw + dpw).Lowercase then exit(false);
+			p += dp; pw += dpw;
+		end;
+		result := (pw > length(what)) and (input.Consume(StringHelper.AsciiSpaces, p, np) or (np > length(input)));
+	end;
+
+	procedure Application.ParseMix(const input: string; p: SizeInt; out np: SizeInt);
+	var
+		p2: SizeInt;
+		task: GenericOp;
+		pl, plOwn: MixOperation;
+		wt: uint;
+		im: ImageName;
+		usingCommas, onameSet: boolean;
+	begin
+		input.Consume(StringHelper.AsciiSpaces, p, p);
+		if input.Prefixed('?', p) or (p > length(input)) then
+			raise ShowHelp.Create(
+				'<R>Примеры:</>' + EOL +
+				'    (E) <1>mix A.png, B.png result.png</> — смешать поровну' + EOL +
+				'    (E) <1>mix A.png, B.png, C.png (2:3:4) result.png</> — в пропорции');
+		np := p;
+		usingCommas := false;
+		onameSet := false;
+
+		task := nil; plOwn := nil;
+		try
+			plOwn := MixOperation.Create; pl := plOwn;
+			task := GenericOp.Create(ir, @plOwn);
+
+			repeat
+				input.Consume(StringHelper.AsciiSpaces, p, p2);
+				if (length(task.inputs) >= 2) and input.Consume('(', p, p) then
+				begin
+					repeat
+						input.Consume(StringHelper.AsciiSpaces, p, p);
+						if not input.Consume(['0' .. '9'], p, p2) then raise Exception.Create('{}...: ожидается вес.'.Format([input.Head(p - 1)]));
+						if not TryParse(input.AB(p, p2), wt) then raise Exception.Create('{}: неверный вес.'.Format([input.Head(p2 - 1).Stuffed(p, 0, '>')]));
+						p := p2;
+						SetLength(pl.inps, length(pl.inps) + 1);
+						pl.inps[High(pl.inps)].weight := wt;
+
+						input.Consume(StringHelper.AsciiSpaces, p, p2);
+						if not input.Consume(':', p2, p) then
+							if input.Consume(')', p, p) then break else
+								raise Exception.Create('{}...: нет закрывающей скобки.'.Format([input.Head(p - 1)]));
+					until false;
+					if length(pl.inps) <> length(task.inputs) then
+						raise Exception.Create('{}: число входных файлов ({}) не соответствует числу весов ({}).'.Format([input.Head(p - 1), length(task.inputs), length(pl.inps)]));
+					break;
+				end;
+
+				if not ParseImageName(im, input, p2, p2) then
+					raise Exception.Create('{}...: ожидается имя файла #{}.'.Format([input.Head(p2 - 1), 1 + length(task.inputs)]));
+				p := p2;
+				input.Consume(StringHelper.AsciiSpaces, p, p);
+
+				if length(task.inputs) = 0 then
+					usingCommas := input.Prefixed(',', p)
+				else
+				begin
+					if not usingCommas and (input.Consume(',', p, p2) or (p > length(input))) then
+					begin
+						task.oname := im;
+						onameSet := true;
+						break;
+					end;
+				end;
+				task.AddInput(im);
+				if usingCommas and not input.Consume(',', p, p) then
+					if input.Consume(['('], p) = p then break;
+			until false;
+			if length(task.inputs) < 2 then raise Exception.Create('{}: недостаточно файлов.'.Format([input.Head(p - 1)]));
+
+			if not onameSet and not ParseImageName(task.oname, input, p, p) then
+				raise Exception.Create('{}...: ожидается имя результирующего файла.'.Format([input.Head(p - 1)]));
+
+			Ary(tasks).Push(task, TypeInfo(tasks));
+			np := p;
+		except
+			task.Free; plOwn.Free;
+			raise;
+		end;
+	end;
+
+	function Application.ParseImageName(out im: ImageName; const input: string; p: SizeInt; out np: SizeInt): boolean;
+	var
+		ed, p2: SizeInt;
+	begin
+		np := p;
+		input.Consume(StringHelper.AsciiSpaces, p, p);
+		if input.Prefixed('"', p) then
+		begin
+			inc(p);
+			input.ConsumeUntil(['"'], p + 1, ed);
+			if ed > length(input) then
+				raise Exception.Create('{}...: строка не завершена.'.Format([input.Head(p)]));
+			p2 := ed + 1;
+		end else
+			if input.Consume([#0 .. #255] - (StringHelper.AsciiSpaces + [',', '(', ')']), p, ed) then p2 := ed else exit(false);
+
+		im := ImageName.Parse(input.AB(p, ed));
 		result := true;
+		np := p2;
+	end;
+
+	procedure Application.ParseTween(const input: string; p: SizeInt; out np: SizeInt);
+	var
+		p2, p3: SizeInt;
+		task: GenericOp;
+		pl, plOwn: TweenOperation;
+		paren, plus: boolean;
+		frames: SizeUint;
+		im: ImageName;
+	begin
+		input.Consume(StringHelper.AsciiSpaces, p, p);
+		if input.Prefixed('?', p) or (p > length(input)) then
+			raise ShowHelp.Create(
+				'<R>Пример:</> (E) <1>tween A.png (+3) B.png (+1) C.png R%frame%.png</>');
+
+		task := nil; plOwn := nil;
+		try
+			plOwn := TweenOperation.Create; pl := plOwn;
+			task := GenericOp.Create(ir, @plOwn);
+
+			repeat
+				if not ParseImageName(im, input, p, p) then
+					raise Exception.Create('{}...: ожидается имя файла #{}.'.Format([input.Head(p - 1), 1 + length(task.inputs)]));
+				task.AddInput(im);
+
+				p3 := p;
+				input.Consume(StringHelper.AsciiSpaces, p, p);
+				paren := input.Consume('(', p, p); if paren then begin p3 := p; input.Consume(StringHelper.AsciiSpaces, p, p); end;
+				plus := input.Consume('+', p, p); if plus then begin p3 := p; input.Consume(StringHelper.AsciiSpaces, p, p); end;
+				if not input.Consume(['0' .. '9'], p, p2) then
+					if paren or plus or (length(task.inputs) <= 1) then
+						raise Exception.Create('{}...: ожидается число кадров.'.Format([input.Head(p3 - 1)]))
+					else
+						break;
+				if not TryParse(input.AB(p, p2), frames) then
+					raise Exception.Create('{}: неверное число кадров.'.Format([input.Head(p2 - 1)]));
+
+				input.Consume(StringHelper.AsciiSpaces, p2, p);
+				if paren and not input.Consume(')', p, p) then
+					raise Exception.Create('{}: ожидается закрывающая скобка.'.Format([input.Head(p2 - 1)]));
+
+				SetLength(pl.inps, length(pl.inps) + 1);
+				pl.inps[High(pl.inps)].extraFrames := frames;
+			until false;
+
+			if not ParseImageName(task.oname, input, p, p) then
+				raise Exception.Create('{}...: ожидается имя результирующего файла.'.Format([input.Head(p - 1)]));
+			Ary(tasks).Push(task, TypeInfo(tasks));
+			np := p;
+		except
+			task.Free; plOwn.Free;
+			raise;
+		end;
+	end;
+
+	function Application.ParseLoadSave(const input: string; p: SizeInt; out np: SizeInt): boolean;
+	var
+		inImage, outImage: ImageName;
+		task: GenericOp;
+		plOwn: LoadSaveOperation;
+	begin
+		np := p;
+		result := ParseImageName(inImage, input, p, p) and ParseImageName(outImage, input, p, p) and
+			(input.Consume(StringHelper.AsciiSpaces, p, p) or true) and (input.Prefixed(',', p) or (p > length(input)));
+		if not result then exit;
+
+		task := nil; plOwn := nil;
+		try
+			plOwn := LoadSaveOperation.Create;
+			task := GenericOp.Create(ir, @plOwn);
+			task.AddInput(inImage);
+			task.oname := outImage;
+			Ary(tasks).Push(task, TypeInfo(tasks));
+			np := p;
+		except
+			task.Free; plOwn.Free;
+			raise;
+		end;
+	end;
+
+	procedure Application.ParseGen(const input: string; p: SizeInt; out np: SizeInt; explicit: boolean);
+		procedure ThrowFormulaHelp;
+		begin
+			raise ShowHelp.Create((
+				'<R>Общий вид формулы:</>' + EOL +
+				'    <1>(G)</>' + EOL +
+				'    <1>(G, A)</>' + EOL +
+				'    <1>(R, G, B)</>' + EOL +
+				'    <1>(R, G, B, A)</>' + EOL +
+				'    <1>(подготовка; результаты)</>' + EOL +
+				'    Перед результатами дописывается return, и формула выполняется как Lua-код.' + EOL +
+				EOL +
+				'<R>Координаты:</>' + EOL +
+				'    <1>x</>, <1>y</>, <1>f</> — пиксель и кадр' + EOL +
+				'    <1>nx</>, <1>ny</>, <1>nf</> — приведённые к [0; 1)' + EOL +
+				'    (<1>n</>)<1>xy</> — векторная версия' + EOL +
+				EOL +
+				'<R>Обращения к входным картинкам:</>' + EOL +
+				'    <1>r</>, <1>g</>, <1>b</>, <1>a</>, <1>gray</>, <1>ga</>, <1>rgb</>, <1>rgba</> — по текущим координатам' + EOL +
+				'    <1>c_r, c_g, c_b = src:rgb(x, y)</> — по произвольным' + EOL +
+				'    <1>c_rgb = src:rgb(xy)</> — векторная версия' + EOL +
+				'    <1>r2</>, <1>src2</>, <1>r3</>... — для последующих' + EOL +
+				EOL +
+				'<R>Встроенные функции:</>' + EOL +
+				'    <1>vec2</>, <1>vec3</>, <1>vec4</>' + EOL +
+				'    <1>min</>, <1>max</>, <1>abs</>, <1>clamp</>, <1>lerp</>, <1>sin</>, <1>cos</>, <1>smoothstep</>, <1>floor</>' + EOL +
+				'    <1>hsv2rgb</>, <1>rgb2hsv</>' + EOL +
+				'    <R>image</> <1>:g()</>, <1>:ga()</>, <1>:rgb()</>, <1>:rgba()</>, <1>.w</>, <1>.h</>, <1>.wh</>' + EOL +
+				'    <R>vec*</> <1>.len</>, <1>.sqlen</>, <1>.nn</>, свиззлы (<1>.rrrg</>, <1>.xyxy</> и т. д.), <1>+</>, <1>-</>, <1>*</>, <1>/</>' + EOL +
+				EOL +
+				'<R>Пример:</>' + EOL +
+				'    <1>(t = (floor(10*nx) + floor(10*ny)) % 2; t, 0.5*t, 0)</>' + EOL +
+				'    — оранжевая шахматная доска на чёрном фоне.').Format([IfThen(explicit, 'gen ')]));
+		end;
+	var
+		p2: SizeInt;
+		task: GenericOp;
+		pl, plOwn: GenerateByScriptOperation;
+		im: ImageName;
+		spec: ImageSpec;
+		sizeSet, formatSet: boolean;
+	begin
+		input.Consume(StringHelper.AsciiSpaces, p, p);
+		if input.Prefixed('?', p) or (explicit and (p > length(input))) then
+			raise ShowHelp.Create((
+				'<R>Примеры:</>' + EOL +
+				'    (E) <1>{0}(1, 0, 0) result.png</> — красный квадратик' + EOL +
+				'    (E) <1>{0}A.png, B.png (rgb + rgb2) result.png</> — с 2 входными файлами' + EOL +
+				'    (E) <1>{0}A.png 300x300 (rgb, x) result.png</> — с явным размером' + EOL +
+				'    ---' + EOL +
+				'    (E) <1>{0}(?)</> — справка по формуле').Format([IfThen(explicit, 'gen ')]));
+
+		task := nil; plOwn := nil;
+		try
+			plOwn := GenerateByScriptOperation.Create; pl := plOwn;
+			task := GenericOp.Create(ir, @plOwn);
+			pl.spec := lastSpec;
+
+			repeat
+				input.Consume(StringHelper.AsciiSpaces, p, p);
+				if ParseSize(input, p, p, spec, sizeSet, formatSet) then
+					if pl.forceSize or pl.forceFormat then
+						raise Exception.Create('{}: размер уже задан.'.Format([input.Head(p - 1)]))
+					else
+					begin
+						if sizeSet then
+						begin
+							pl.forceSize := true;
+							pl.spec.w := spec.w;
+							pl.spec.h := spec.h;
+							pl.spec.frames := spec.frames;
+							newLastSpec.w := spec.w;
+							newLastSpec.h := spec.h;
+							// а вот число кадров не запоминать, как и формат
+						end;
+						if formatSet then begin pl.forceFormat := true; pl.spec.format := spec.format; end;
+						continue;
+					end;
+
+				if input.Consume('(', p, p) then
+				begin
+					if (input.Consume(StringHelper.AsciiSpaces, p, p2) or true) and input.Consume('?', p2, p2) and
+						(input.Consume(StringHelper.AsciiSpaces, p2, p2) or true) and input.Consume(')', p2, p2) then ThrowFormulaHelp;
+					ParseExpr(input, p, p, pl.source);
+					break;
+				end;
+
+				if not ParseImageName(im, input, p, p) then
+					raise Exception.Create('{}...: ожидается имя файла или (фор, му, ла).'.Format([input.Head(p - 1), 1 + length(task.inputs)]));
+				input.Consume(StringHelper.AsciiSpaces, p, p);
+				input.Consume(',', p, p);
+				task.AddInput(im);
+			until false;
+
+			if not ParseImageName(task.oname, input, p, p) then
+				raise Exception.Create('{}...: ожидается имя результирующего файла.'.Format([input.Head(p - 1)]));
+
+			Ary(tasks).Push(task, TypeInfo(tasks));
+			np := p;
+		except
+			task.Free; plOwn.Free;
+			raise;
+		end;
+	end;
+
+	function Application.ParseSize(const input: string; p: SizeInt; out np: SizeInt; out spec: ImageSpec; out sizeSet, formatSet: boolean): boolean;
+	var
+		p2, p3, p4: SizeInt;
+		fmt: ImageFormat;
+		fms: string;
+	begin
+		result := false;
+		np := p;
+		input.Consume(StringHelper.AsciiSpaces, p, p);
+		if input.Consume(['0' .. '9'], p, p2) and input.Consume('x', p2, p3) and input.Consume(['0' .. '9'], p3, p4) then
+		begin
+			if not TryParse(input.AB(p, p2), spec.w) or not TryParse(input.AB(p3, p4), spec.h) or (spec.w = 0) or (spec.h = 0) then
+				raise Exception.Create('{}: неверный размер.'.Format([input.Head(p4 - 1)]));
+			p := p4;
+
+			if input.Consume('x', p, p) then
+			begin
+				if not input.Consume(['0' .. '9'], p, p2) then raise Exception.Create('{}...: ожидается число кадров.'.Format([input.Head(p - 1)]));
+				if not TryParse(input.AB(p, p2), spec.frames) or (spec.frames = 0) then raise Exception.Create('{}: неверное число кадров.');
+				p := p2;
+			end else
+				spec.frames := 1;
+			sizeSet := true;
+			formatSet := false;
+
+			if input.Consume('@', p, p) then
+			begin
+				if not input.ConsumeUntil([' ', ','], p, p2) then
+					raise Exception.Create('{}: ожидается формат.'.Format([input.Head(p - 1)]));
+				fms := input.AB(p, p2); p := p2;
+
+				for fmt in ImageFormat do
+					if fmt.id = fms then
+					begin
+						spec.format := fmt;
+						formatSet := true;
+						break;
+					end;
+				if not formatSet then
+					raise Exception.Create('{}: неизвестный формат.'.Format([input.Head(p - 1)]));
+			end;
+
+			result := (p > length(input)) or (input[p] in [' ', ',']);
+			if result then np := p;
+		end;
+	end;
+
+	procedure Application.ParseExpr(const input: string; p: SizeInt; out np: SizeInt; out source: string);
+		procedure SkipString(var p: SizeInt; quote: char);
+		begin
+			while p <= length(input) do
+			begin
+				if input[p] = quote then
+				begin
+					inc(p);
+					exit;
+				end;
+				if input[p] = '\' then inc(p); // следующий инкремент скипнет символ после "\"
+				inc(p);
+			end;
+			raise Exception.Create('{}: незавершённая строка.'.Format([input]));
+		end;
+
+		function ReadLongStringStart(var p: SizeInt): SizeInt;
+		var
+			cp: SizeInt;
+		begin
+			Assert(input[p] = '[');
+			result := 0;
+			for cp := p + 1 to length(input) do
+				case input[cp] of
+					'=': inc(result);
+					'[': begin p := cp + 1; exit; end;
+					else break;
+				end;
+			result := -1;
+		end;
+
+		function IsLongStringEnding(const s: string; pos, ls: SizeInt): boolean;
+		var
+			i: SizeInt;
+		begin
+			result := (s[pos] = ']') and (s[pos + ls + 1] = ']');
+			if result then
+				for i := 1 to ls do
+					if s[pos + i] <> '=' then exit(false);
+		end;
+
+		procedure SkipLongString(var p: SizeInt; ls: SizeInt);
+		var
+			i: SizeInt;
+		begin
+			for i := p to length(input) - ls - 2 + 1 do
+				if IsLongStringEnding(input, i, ls) then
+				begin
+					p := i + ls + 2;
+					exit;
+				end;
+			raise Exception.Create('{}: незавершённая длинная строка.'.Format([input]));
+		end;
+	var
+		level, p2, ls, insertReturnAt, start: SizeInt;
+		lastMeaningfulChar: char;
+	begin
+		start := input.Consume(StringHelper.AsciiSpaces, p);
+		level := 0;
+		lastMeaningfulChar := #0;
+		insertReturnAt := start;
+
+		repeat
+			if p > length(input) then
+				raise Exception.Create('{}: формула не завершена.'.Format([input]));
+
+			if input[p] in StringHelper.AsciiSpaces then
+			begin
+				inc(p);
+				continue;
+			end;
+
+			case input[p] of
+				'a'..'z', 'A'..'Z', '_':
+					begin
+						p2 := p + 1;
+						while pChar(input)[p2 - 1] in ['a'..'z', 'A'..'Z', '0'..'9', '_'] do inc(p2);
+						if input.Prefixed('end', p) and (p2 - p = length('end')) then
+						begin
+							dec(level);
+							if level < 0 then raise Exception.Create('{}: {} не в тему.'.Format([input.Head(p2 - 1), input.AB(p, p2)]));
+						end;
+
+						if input.Prefixed('function', p) and (p2 - p = length('function')) or
+							input.Prefixed('do', p) and (p2 - p = length('do')) or
+							input.Prefixed('then', p) and (p2 - p = length('then')) then
+							inc(level);
+						if input.Prefixed('return', p) and (p2 - p = length('return')) and (lastMeaningfulChar = ';') then insertReturnAt := -1;
+						p := p2;
+					end;
+				'"', '''': begin inc(p); SkipString(p, input[p - 1]); end;
+				'-':
+					begin
+						if pChar(input)[p + 1 - 1] = '-' then
+						begin
+							p += 2;
+							if pChar(input)[p - 1] = '[' then ls := ReadLongStringStart(p) else ls := -1;
+							if ls >= 0 then SkipLongString(p, ls) else
+								while not (pChar(input)[p - 1] in [#13, #10]) do inc(p);
+						end else
+							inc(p);
+						continue;
+					end;
+				'[':
+					begin
+						ls := ReadLongStringStart(p);
+						if ls >= 0 then
+							SkipLongString(p, ls)
+						else
+						begin
+							inc(p);
+							inc(level);
+						end;
+					end;
+				'{', '(':
+					begin
+						inc(level);
+						inc(p);
+					end;
+				']', ')', '}':
+					begin
+						dec(level);
+						inc(p);
+						if level < 0 then
+						begin
+							if input[p-1] <> ')' then raise Exception.Create('{}: {} не в тему.'.Format([input.Head(p), input[p]]));
+							source := input.AB(start, p - 1);
+							if insertReturnAt > 0 then source := source.Stuffed(insertReturnAt - start + 1, 0, 'return ');
+							break;
+						end;
+					end;
+				';':
+					begin
+						p2 := p + 1;
+						while pChar(input)[p2 - 1] in StringHelper.AsciiSpaces do inc(p2);
+						insertReturnAt := p2;
+						inc(p);
+					end;
+				else inc(p);
+			end;
+			lastMeaningfulChar := input[p-1];
+		until false;
+		np := p;
 	end;
 
 var
@@ -6267,7 +6974,7 @@ begin
 			app.Init;
 			input := Win32.CommandLineTail;
 			app.repl := input = '';
-			if app.repl then Con.ColoredLine('<gb>Справка: ?');
+			if app.repl then Con.ColoredLine('<gb>(c) <rb>Rika Ichinose</>, 2018' + EOL + '<gb>Справка: ?' + EOL);
 			repeat
 				if app.repl then
 				begin
@@ -6278,8 +6985,8 @@ begin
 		except
 			Con.ResetCtrlC;
 			if Exception.Current is Interception then
-				if app.repl then begin Con.Colored('<gb>' + Exception.Message); if app.repl then Con.ReadLine; end else
-			else begin Con.Colored('<R>' + Con.Escape(Exception.Message)); if app.repl then Con.ReadLine; end;
+				if app.repl then Con.ColoredLine('<gb>' + Exception.Message) else
+			else begin Con.Colored('<R>' + Con.Escape(Exception.Message) + IfThen(not app.repl, EOL)); if app.repl then readln; end;
 		end;
 	finally
 		app.Done;
